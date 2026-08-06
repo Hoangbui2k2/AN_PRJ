@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "crc.c"
+        "config.c"
+        "lora_uart.c"
+        "sensors.c"
+        "pump.c"
+        "power.c"
+        "alarms.c"
+        "irrigation.c"
+        "commands.c"
+    INCLUDE_DIRS
+        "."
+)

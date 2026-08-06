@@ -1,0 +1,55 @@
+# ──────────── Power Management ────────────
+# Deep sleep optimizations for <100µA target
+# NOTE: RTC_PERIPH is kept powered (not set) because EXT0 wakeup (button GPIO34)
+#       and RTC_SLOW_MEM (config persistence) require it.  The firmware calls
+#       esp_sleep_pd_config() explicitly before each sleep, so the defaults here
+#       are deliberately permissive.
+CONFIG_ESP_SLEEP_POWER_DOWN_FLASH=y
+CONFIG_SYSTEM_EVENT_TASK_STACK_SIZE=2048
+CONFIG_ESP_SYSTEM_PM_ENABLE=n
+CONFIG_ESP_SYSTEM_PM_POWER_DOWN_CPU=y
+
+# ──────────── Clock & Timer ────────────
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_TICK_USE_CORETIMER=y
+
+# ──────────── Log Level ────────────
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# ──────────── ADC ────────────
+CONFIG_ADC_DISABLE_DAC=y
+
+# ──────────── UART ────────────
+# UART2 is used for LoRa (GPIO16/17)
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_SECONDARY_UART_NONE=y
+
+# ──────────── Partition Table ────────────
+# Single-app partition table (factory-only, no OTA)
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
+
+# ──────────── Flash Settings ────────────
+# Typical ESP32 DevKit V1 has 4 MB flash; if your board has 2 MB change to 2MB
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# DIO is the safest flash mode for most ESP32 modules; QIO can be faster but
+# may require strapping pins — enable QIO only if your hardware supports it.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+
+# ──────────── Compiler Optimizations ────────────
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# CONFIG_COMPILER_OPTIMIZATION_PERF is not set
+
+# ──────────── GPIO ────────────
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
+
+# ──────────── Task Watchdog ────────────
+CONFIG_ESP_TASK_WDT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+
+# ──────────── Main Task Stack ────────────
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=2048
