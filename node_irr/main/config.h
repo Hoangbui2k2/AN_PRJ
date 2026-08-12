@@ -69,14 +69,19 @@ typedef enum {
 #define PRESENCE_ALL  (PRESENCE_TEMP | PRESENCE_HUM | PRESENCE_SOIL | PRESENCE_BATTERY | PRESENCE_FLAGS)
 
 /* ──────────── Gateway Protocol Timing (new gateway) ──────────── */
-#define DOWNLINK_WINDOW_MS      350    /* Post-uplink downlink listen window (spec: 200-500ms) */
-#define GATEWAY_LOST_TIMEOUT_S  180    /* No downlink for this long → gatewayLostCount++ (spec example) */
+/* Post-uplink downlink listen window. Must be long enough for the gateway to
+ * finish processing the uplink (MQTT publish + worker) and reply with a
+ * keep-alive 0x09 — otherwise the node keeps retrying as if no gateway was
+ * there (log: "no downlink" + immediate repeat). 800 ms matches the observed
+ * gateway round-trip including its worker/queue. */
+#define DOWNLINK_WINDOW_MS      800
+#define GATEWAY_LOST_TIMEOUT_S  600    /* No downlink for this long → gatewayLostCount++ */
 #define GW_LOST_ALARM_THRESHOLD 3      /* gatewayLostCount >= 3 → GW_LOST flag + alarm 0x05 */
 
 /* ──────────── Threshold Defaults ──────────── */
 #define THRESHOLD_LOW_DEFAULT     30    /* Default lower threshold (%) */
 #define THRESHOLD_HIGH_DEFAULT    70    /* Default upper threshold (%) */
-#define HEARTBEAT_CYCLES          2     /* Send data heartbeat every N cycles */
+#define HEARTBEAT_CYCLES          5     /* Send heartbeat after N cycles without any uplink */
 
 /* ──────────── Delta Thresholds (change since last send) ──────────── */
 #define TEMP_DELTA_THRESHOLD      20    /* 2.0°C, stored as °C × 10 */
@@ -142,6 +147,10 @@ typedef struct __attribute__((packed)) {
     bool     thresholdExceeded; /* Set when soil moisture exceeds thresholds */
     uint16_t cyclesSinceSend;   /* Cycles since last data transmission */
     uint8_t  alarmCode;         /* Active alarm code (alarm_type_t) */
+    uint8_t  lastAlarmCode;     /* Alarm code already reported (0=none). Edge-detect. */
+    uint8_t  persistedAlarmCode;/* Alarm active at raise time, persisted to NVS,
+                                 * NOT cleared when alarm clears (source for
+                                 * post-boot comparison). */
     uint32_t totalPumpCycles;   /* Total number of pump cycles */
     uint32_t lastScheduleTime;  /* Last synced schedule epoch time */
     bool     pumpBySchedule;    /* Flag indicating pump was started by schedule */
@@ -173,6 +182,13 @@ app_config_t *config_get(void);
 
 void config_set_alarm(uint8_t alarm);
 void config_clear_alarm(void);
+uint8_t config_get_alarm(void);
+uint8_t config_get_last_alarm(void);
+void config_set_last_alarm(uint8_t code);
+uint8_t config_get_persisted_alarm(void);
+void config_set_persisted_alarm(uint8_t code);
+void save_alarm_state_to_nvs(void);
+void load_alarm_state_from_nvs(void);
 void config_set_pump_state(bool on);
 void config_toggle_pump(void);
 void config_set_mode(operation_mode_t mode);

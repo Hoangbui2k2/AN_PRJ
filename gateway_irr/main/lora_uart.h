@@ -53,6 +53,7 @@ typedef struct __attribute__((packed)) {
 #define PKT_TYPE_HEARTBEAT      0x02  /* Node heartbeat — just alive signal */
 #define PKT_TYPE_ACK            0x03  /* ACK for received commands */
 #define PKT_TYPE_ALARM          0x04  /* Sensor alarm */
+#define PKT_TYPE_CMD            0x05  /* Gateway → node downlink command (6 bytes) */
 #define PKT_TYPE_DATA_COMPACT   0x06  /* Compact variable-length data (4-9 bytes) */
 
 /* Uplink Flags (byte 2 in legacy / flags field in compact payload) */

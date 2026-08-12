@@ -199,6 +199,41 @@ cached_command_t* command_cache_get_retry_ready(void)
     return first;
 }
 
+/**
+ * @brief Advance retry bookkeeping for commands whose ACK timed out, and drop
+ *        commands that exceeded MAX_RETRY.
+ *
+ * Bookkeeping-only: it never transmits. Actual (re)transmission is driven by
+ * the uplink path (send_cached_commands_for_node via ack_or_flush_node), which
+ * is the only time we know the node is awake. This keeps a command that was
+ * sent but not ACKed from being forgotten: after ACK_TIMEOUT_MS it becomes
+ * "ready" again (waiting_ack cleared, retry_count++), so the next uplink from
+ * the node re-flushes it.
+ */
+void command_cache_process_timeouts(void)
+{
+    uint64_t now_ms = esp_timer_get_time() / 1000;
+
+    for (int i = 0; i < MAX_CACHED_COMMANDS; i++) {
+        cached_command_t *c = &s_cache[i];
+        if (!c->pending || c->acked) {
+            continue;
+        }
+
+        if (c->waiting_ack && c->last_sent_ms != 0 &&
+            (now_ms - c->last_sent_ms) >= ACK_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "ACK timeout for node 0x%02X (%llu ms since send)",
+                     c->node_id, (unsigned long long)(now_ms - c->last_sent_ms));
+            command_cache_advance_retry(c);
+            if (c->retry_count >= MAX_RETRY) {
+                ESP_LOGW(TAG, "Command for node 0x%02X exceeded max retries (%d), dropping",
+                         c->node_id, MAX_RETRY);
+                c->pending = false;
+            }
+        }
+    }
+}
+
 void command_cache_advance_retry(cached_command_t *cmd)
 {
     cmd->retry_count++;

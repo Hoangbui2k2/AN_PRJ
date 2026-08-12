@@ -1,0 +1,33 @@
+{
+  "name": "toggle_roundtrip",
+  "description": "TC-F01: Round-trip toggle. Server gửi toggle → node thực thi → data mới có pump đổi. Theo dõi 2 data liên tiếp để so sánh pump.",
+  "timeout_seconds": 60,
+  "steps": [
+    {
+      "name": "Chụp pump hiện tại (baseline data #1)",
+      "action": "expect",
+      "timeout": 20,
+      "expect_msg": {
+        "topic_regex": "node_01/data$",
+        "schema": "data",
+        "expect": {"node": 1}
+      }
+    },
+    {
+      "name": "Gửi lệnh toggle cho node 0x01",
+      "action": "publish_cmd",
+      "node": 1,
+      "cmd": {"cmd": "toggle"}
+    },
+    {
+      "name": "Chờ data mới xuất hiện (pump đổi)",
+      "action": "expect",
+      "timeout": 25,
+      "expect_msg": {
+        "topic_regex": "node_01/data$",
+        "schema": "data",
+        "expect": {"node": 1}
+      }
+    }
+  ]
+}

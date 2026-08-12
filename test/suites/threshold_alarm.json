@@ -1,0 +1,27 @@
+{
+  "name": "threshold_alarm",
+  "description": "TC-C02/F02: Khi soil ngoài ngưỡng → data có threshold_exceeded=true + alarm 3b kèm threshold_low/high.",
+  "timeout_seconds": 120,
+  "steps": [
+    {
+      "name": "Chờ data vượt ngưỡng (threshold_exceeded=true)",
+      "action": "expect",
+      "timeout": 90,
+      "expect_msg": {
+        "topic_regex": "node_01/data$",
+        "schema": "data",
+        "expect": {"node": 1, "threshold_exceeded": true}
+      }
+    },
+    {
+      "name": "Chờ alarm 'Sensor alarm triggered'",
+      "action": "expect",
+      "timeout": 60,
+      "expect_msg": {
+        "topic_regex": "node_01/alarm$",
+        "schema": "alarm",
+        "expect": {"message": "Sensor alarm triggered"}
+      }
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "name": "bootstrap",
+  "description": "TC-A02/A03: Gateway boot online, hòặc heartbeat định kỳ, data schema đầu tiên.",
+  "timeout_seconds": 200,
+  "steps": [
+    {
+      "name": "TC-A02 nhận gateway online khi connect",
+      "action": "expect",
+      "timeout": 60,
+      "expect_msg": {
+        "topic_regex": "/status$",
+        "schema": "gw_status",
+        "expect": {"status": "online"}
+      }
+    },
+    {
+      "name": "TC-A03 heartbeat #1 (60s)",
+      "action": "expect",
+      "timeout": 75,
+      "expect_msg": {
+        "topic_regex": "/status$",
+        "schema": "gw_status",
+        "expect": {"status": "online"}
+      }
+    },
+    {
+      "name": "TC-A03 heartbeat #2 (120s), nodes_registered=2",
+      "action": "expect",
+      "timeout": 75,
+      "expect_msg": {
+        "topic_regex": "/status$",
+        "schema": "gw_status",
+        "expect": {"nodes_registered": 2}
+      }
+    },
+    {
+      "name": "TC-A01: node 0x01 publish data schema hợp lệ",
+      "action": "expect",
+      "timeout": 60,
+      "expect_msg": {
+        "topic_regex": "node_01/data$",
+        "schema": "data"
+      }
+    }
+  ]
+}

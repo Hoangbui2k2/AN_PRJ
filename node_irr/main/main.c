@@ -80,6 +80,91 @@ static void check_and_update_alarms(const sensor_data_t *data)
     /* 4. Gateway Lost: detected in the heartbeat path (commands.c, spec C).
      * Alarm 0x05 is raised exactly when gatewayLostCount first reaches
      * GW_LOST_ALARM_THRESHOLD, so it is not duplicated here. */
+
+    /* 5. Edge-triggered clearing: if a sensor-related alarm's condition is no
+     * longer met, clear it so the edge-detect in Step 11 can send the 0x00
+     * "alarm cleared" packet. RELAY_ERROR and GATEWAY_LOST are latched from
+     * other paths and cleared there (pump success / valid downlink). */
+    if (cfg->alarmCode == ALARM_SENSOR_ERROR && data->sensor_error == 0) {
+        config_clear_alarm();
+    } else if (cfg->alarmCode == ALARM_SOIL_OUT_RANGE &&
+               (data->sensor_error & 0x02) == 0 &&
+               data->soil_moisture_pct >= 10 && data->soil_moisture_pct <= 90) {
+        config_clear_alarm();
+    } else if (cfg->alarmCode == ALARM_LOW_BATTERY && data->battery >= 20) {
+        config_clear_alarm();
+    }
+}
+
+/**
+ * @brief Reconcile an alarm that was active before a power loss / cold boot
+ *
+ * After reset, config_load_alarm_state() restores persistedAlarmCode (the
+ * alarm that was active when it was raised, saved to NVS) and lastAlarmCode
+ * (what the gateway was last told). sensor_data has just been read, so we can
+ * decide how to resume:
+ *
+ *   - Alarm still active (sensor OK + condition true)  → gateway already knows,
+ *     do nothing.
+ *   - Alarm truly cleared (sensor OK + condition gone) → tell the gateway by
+ *     sending code 0x00.
+ *   - Cannot tell (sensor read error / unknown)        → re-send the persisted
+ *     active alarm so the gateway knows status is uncertain.
+ *
+ * Runs only on the cycle immediately after boot (persistedAlarmCode != NONE),
+ * then resets the snapshot so later cycles use normal edge detection.
+ */
+static void handle_boot_alarm_recovery(const sensor_data_t *data)
+{
+    app_config_t *cfg = config_get();
+    uint8_t persisted = config_get_persisted_alarm();
+    if (persisted == ALARM_NONE) {
+        return;   /* nothing to restore — normal wake cycle */
+    }
+
+    /* cur is cfg->alarmCode after check_and_update_alarms ran this cycle.
+     * If a condition is still true, it equals persisted; if cleared, it is
+     * ALARM_NONE; if sensor failed, it may be NONE too. */
+    uint8_t cur = cfg->alarmCode;
+    bool certain = (data->sensor_error == 0);
+
+    /* Only sensor-driven alarms can be verified as "cleared" after boot.
+     * RELAY_ERROR / GATEWAY_LOST have no sensor condition to check, so they
+     * are always treated as still-present → re-send active code. */
+    bool can_verify_clear =
+        (persisted == ALARM_SENSOR_ERROR ||
+         persisted == ALARM_SOIL_OUT_RANGE ||
+         persisted == ALARM_LOW_BATTERY);
+
+    if (certain && can_verify_clear) {
+        if (cur == persisted) {
+            ESP_LOGI(TAG, "Boot recovery: alarm 0x%02X still active — no re-send",
+                     persisted);
+            /* Keep lastAlarmCode in sync with the known-active code so the
+             * edge-detect in Step 11 sees cur == last and does NOT re-send. */
+            config_set_last_alarm(persisted);
+        } else {
+            ESP_LOGI(TAG, "Boot recovery: alarm 0x%02X cleared — sending 0x00",
+                     persisted);
+            commands_send_alarm(cfg->nodeId, ALARM_NONE, data);
+            config_set_last_alarm(ALARM_NONE);
+        }
+    } else {
+        /* Either sensors unknown after boot, or the persisted alarm type
+         * cannot be verified (relay / gateway-lost). Re-send the active code
+         * so the gateway knows the alarm (likely) still exists. */
+        ESP_LOGI(TAG, "Boot recovery: cannot verify (%scertain, code 0x%02X), "
+                 "re-sending alarm 0x%02X",
+                 certain ? "" : "not-", persisted, persisted);
+        commands_send_alarm(cfg->nodeId, persisted, data);
+        config_set_last_alarm(persisted);
+        /* Keep alarmCode in sync so Step 11 edge-detect (cur vs last) does not
+         * re-transmit the same alarm again. */
+        cfg->alarmCode = persisted;
+    }
+
+    /* Snapshot consumed — clear so later cycles use normal edge-detect. */
+    config_set_persisted_alarm(ALARM_NONE);
 }
 
 /* ──────────── Application Entry ──────────── */
@@ -117,6 +202,11 @@ void app_main(void)
 
     /* Load persisted thresholds from NVS (overrides defaults if present) */
     load_threshold_from_nvs();
+
+    /* Restore alarm snapshot + last-reported code from NVS so a cold boot /
+     * power loss remembers whether the gateway already knows an alarm. On a
+     * deep-sleep wake these values equal the RTC ones (harmless reload). */
+    load_alarm_state_from_nvs();
     power_init();            /* MOSFET sensor power and Wake Button */
     sensors_init();          /* DHT22 and Soil Moisture ADC */
     pump_init();             /* CD4013 clock toggle pin */
@@ -126,6 +216,7 @@ void app_main(void)
 
     app_config_t *cfg = config_get();
 
+    power_sensor_on();
     /* ── Step 4: Handle wake causes ── */
 
     if (button_wake) {
@@ -146,13 +237,13 @@ void app_main(void)
         pump_toggle();
 
         /* Read sensors and transmit status update so gateway receives immediate pump state change */
-        power_sensor_on();
-        vTaskDelay(pdMS_TO_TICKS(7000));
+        // power_sensor_on();
+        // vTaskDelay(pdMS_TO_TICKS(7000));
         sensor_data_t sensor_data;
         sensors_read(&sensor_data);
-        vTaskDelay(pdMS_TO_TICKS(2000)); /* Allow sensors to stabilize */
+        // vTaskDelay(pdMS_TO_TICKS(2000)); /* Allow sensors to stabilize */
 
-        power_sensor_off();
+        // power_sensor_off();
 
         ESP_LOGI(TAG, "Transmitting updated status after button toggle");
         commands_send_data_with_ack(cfg->nodeId, &sensor_data);
@@ -170,7 +261,7 @@ void app_main(void)
     /* ── Timer Wake or Cold Boot cycle ── */
 
     /* Step 5: Power sensors via MOSFET and read data */
-    power_sensor_on();
+    // power_sensor_on();
     // vTaskDelay(pdMS_TO_TICKS(7000)); /* Allow sensors to stabilize */
 
     sensor_data_t sensor_data;
@@ -180,6 +271,10 @@ void app_main(void)
 
     /* Step 6: Perform Alarm Checks */
     check_and_update_alarms(&sensor_data);
+
+    /* Step 6b: Reconcile an alarm that survived a power loss / cold boot
+     * (persisted snapshot). Runs once; normal edge-detect resumes after. */
+    handle_boot_alarm_recovery(&sensor_data);
 
     /* Step 7: Check for commands prior to irrigation execution */
     commands_check_pending(&sensor_data);
@@ -195,12 +290,18 @@ void app_main(void)
      *                                        fields, ONLY when something changed
      *                                        (no repeat on unchanged value)
      * 3. Sensor delta detected             → compact 0x06 (only changed fields)
-     * 4. Periodic heartbeat due            → heartbeat 0x02 (flags+battery+readings)
+     * 4. Periodic heartbeat due            → heartbeat 0x02 (flags+battery only)
      * 5. Otherwise                         → skip (power saving — no LoRa TX)
      */
     uint8_t delta = node_check_delta_fields(&sensor_data);
     bool exceeded = node_check_threshold(sensor_data.soil_moisture_pct);
     bool data_heartbeat = is_heartbeat_time();
+
+    /* DEBUG: which branch will win in the send decision below */
+    ESP_LOGI(TAG, "DBG send-decision: lastSent=%d delta=0x%02X exceeded=%d "
+             "hb=%d cyclesSinceSend=%d hb_cycles=%d",
+             cfg->lastSentTemp, delta, exceeded, data_heartbeat,
+             cfg->cyclesSinceSend, HEARTBEAT_CYCLES);
 
     if (cfg->lastSentTemp == INT8_MIN) {
         /* First send since cold boot — send full 0x01 so gateway has a baseline */
@@ -221,8 +322,25 @@ void app_main(void)
                 node_store_last_sent_compact(&sensor_data, presence);
             }
             reset_cycle_counter();
+        } else if (data_heartbeat) {
+            /* Soil still out of range but unchanged: don't re-send the same
+             * soil value, but DO send the liveness heartbeat when one is due.
+             * commands_build_heartbeat_packet still carries
+             * FLAG_THRESHOLD_EXCEEDED (soil out of range) in its flags byte,
+             * so the gateway sees both liveness and the exceeded state. */
+            ESP_LOGI(TAG, "Soil still %d%% out of range, unchanged — sending heartbeat (0x02)",
+                     sensor_data.soil_moisture_pct);
+            if (commands_send_heartbeat(cfg->nodeId, sensor_data.battery, &sensor_data) == 0) {
+                /* Update lastSentSoil too so node_check_delta_fields stops
+                 * reporting PRESENCE_SOIL every cycle (the heartbeat itself
+                 * does not carry soil). */
+                node_store_last_sent_compact(&sensor_data,
+                    PRESENCE_SOIL | PRESENCE_FLAGS | PRESENCE_BATTERY);
+            }
+            reset_cycle_counter();
         } else {
-            ESP_LOGI(TAG, "Soil still %d%% exceeds threshold but unchanged — skipping send (heartbeat will carry it)",
+            ESP_LOGI(TAG, "Soil still %d%% exceeds threshold — skipping send "
+                     "(resend on next soil delta)",
                      sensor_data.soil_moisture_pct);
         }
     } else if (delta) {
@@ -246,12 +364,27 @@ void app_main(void)
     /* Step 10: Check for commands after data send (downlink window) */
     commands_check_pending(&sensor_data);
 
-    /* Step 11: Handle any active alarms */
-    if (cfg->alarmCode != ALARM_NONE) {
-        ESP_LOGW(TAG, "Active alarm: 0x%02X. Signaling and sending alarm packet.", cfg->alarmCode);
-        commands_send_alarm(cfg->nodeId, cfg->alarmCode, &sensor_data);
-        alarms_signal((alarm_type_t)cfg->alarmCode);
-        config_clear_alarm();
+    /* Step 11: Edge-triggered alarm reporting — send ONE packet when an alarm
+     * starts (NONE -> code) and ONE packet with code 0x00 when it clears
+     * (code -> NONE). Do NOT re-send while the same alarm stays active. */
+    uint8_t cur_alarm = config_get_alarm();
+    uint8_t prev_alarm = config_get_last_alarm();
+
+    if (cur_alarm != prev_alarm) {
+        if (cur_alarm != ALARM_NONE) {
+            /* New alarm appeared */
+            ESP_LOGW(TAG, "Alarm START 0x%02X (was 0x%02X) -> sending", cur_alarm, prev_alarm);
+            commands_send_alarm(cfg->nodeId, cur_alarm, &sensor_data);
+            alarms_signal((alarm_type_t)cur_alarm);
+        } else {
+            /* Alarm cleared */
+            ESP_LOGI(TAG, "Alarm CLEARED (was 0x%02X) -> sending 0x00", prev_alarm);
+            commands_send_alarm(cfg->nodeId, ALARM_NONE, &sensor_data);
+        }
+        config_set_last_alarm(cur_alarm);
+        /* Do NOT clear cfg->alarmCode here: it latches the current active
+         * alarm. It is only zeroed when conditions actually clear (see
+         * check_and_update_alarms) or when a downlink clears it. */
     }
 
     /* Step 12: Verify CD4013 GPIO state */

@@ -125,8 +125,19 @@ void command_cache_clear_for_node(uint8_t node_id);
 cached_command_t* command_cache_get_retry_ready(void);
 
 /**
+ * @brief Advance retry bookkeeping for commands whose ACK timed out, and drop
+ *        commands that exceeded MAX_RETRY.
+ *
+ * Bookkeeping-only: it NEVER transmits. Actual (re)transmission happens in the
+ * uplink path (send_cached_commands_for_node via ack_or_flush_node), which is
+ * the only moment we know the node is truly awake. After an ACK timeout a
+ * command becomes "ready" again so the next uplink re-flushes it.
+ */
+void command_cache_process_timeouts(void);
+
+/**
  * @brief Advance retry state for a command (increment count, set next retry time)
- * 
+ *
  * @param cmd Pointer to the command entry
  */
 void command_cache_advance_retry(cached_command_t *cmd);

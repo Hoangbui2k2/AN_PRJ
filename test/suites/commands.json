@@ -1,0 +1,43 @@
+{
+  "name": "commands",
+  "description": "TC-D02..D07: Gửi từng lệnh server cho node, chờ data phản hồi (chứng minh lệnh được forward & xử lý).",
+  "timeout_seconds": 240,
+  "steps": [
+    {
+      "name": "set_interval 300s",
+      "action": "publish_cmd",
+      "node": 1,
+      "cmd": {"cmd": "set_interval", "value": 300}
+    },
+    {
+      "name": "Chờ data sau set_interval",
+      "action": "expect",
+      "timeout": 40,
+      "expect_msg": {"topic_regex": "node_01/data$", "schema": "data", "expect": {"node": 1}}
+    },
+    {
+      "name": "set_mode 1 (Schedule)",
+      "action": "publish_cmd",
+      "node": 1,
+      "cmd": {"cmd": "set_mode", "mode": 1}
+    },
+    {
+      "name": "set_delta soil = 5",
+      "action": "publish_cmd",
+      "node": 1,
+      "cmd": {"cmd": "set_delta", "type": 2, "value": 5}
+    },
+    {
+      "name": "report (ép gửi data ngay)",
+      "action": "publish_cmd",
+      "node": 1,
+      "cmd": {"cmd": "report"}
+    },
+    {
+      "name": "Chờ data sau report",
+      "action": "expect",
+      "timeout": 25,
+      "expect_msg": {"topic_regex": "node_01/data$", "schema": "data", "expect": {"node": 1}}
+    }
+  ]
+}

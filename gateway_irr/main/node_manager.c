@@ -45,6 +45,7 @@ node_entry_t* node_find_or_create(uint8_t id)
     node->delta_battery = DELTA_BATTERY_DEFAULT;
     node->report_interval = REPORT_INTERVAL_DEFAULT;
     node->heartbeat_interval = HEARTBEAT_INTERVAL_MS / 1000;
+    node->sleep_interval_s = REPORT_INTERVAL_DEFAULT;   /* default deep-sleep period */
     node->schedule_hour = 6;
     node->schedule_minute = 0;
     node->mode = 1;
@@ -81,15 +82,16 @@ bool node_register(uint8_t id, uint8_t threshold_low, uint8_t threshold_high,
     node->delta_battery = delta_battery;
     node->report_interval = report_interval;
     node->heartbeat_interval = heartbeat_interval;
+    node->sleep_interval_s = (report_interval == 0 ? REPORT_INTERVAL_DEFAULT : report_interval);
     node->schedule_hour = schedule_hour;
     node->schedule_minute = schedule_minute;
     node->mode = mode;
 
     ESP_LOGI(TAG, "Registered default node 0x%02X: Thr=[%d-%d] Delta=[t%d/h%d/s%d/b%d] "
-             "Report=%d s Heartbeat=%d s Schedule=%02d:%02d Mode=%d",
+             "Report=%d s Heartbeat=%d s Sleep=%d s Schedule=%02d:%02d Mode=%d",
              id, threshold_low, threshold_high, delta_temp, delta_hum,
              delta_soil, delta_battery, report_interval, heartbeat_interval,
-             schedule_hour, schedule_minute, mode);
+             node->sleep_interval_s, schedule_hour, schedule_minute, mode);
     return true;
 }
 
@@ -126,6 +128,21 @@ void node_update_data(uint8_t id, uint8_t soil, int8_t temp, uint8_t hum,
     }
 }
 
+/**
+ * @brief Per-node offline timeout, derived from the node's heartbeat period.
+ *
+ * Node sends a heartbeat every (NODE_HB_CYCLES+1) wake cycles; each wake cycle
+ * lasts sleep_interval_s seconds. Timeout = 2 × heartbeat period, with a 60s
+ * floor so a fast node is never marked offline too early.
+ */
+static uint64_t node_timeout_ms(const node_entry_t *n)
+{
+    uint32_t s = (n->sleep_interval_s == 0) ? REPORT_INTERVAL_DEFAULT : n->sleep_interval_s;
+    uint64_t t = (uint64_t)s * (NODE_HB_CYCLES + 1) * NODE_TIMEOUT_HB_MULT * 1000ULL;
+    if (t < NODE_TIMEOUT_MIN_MS) t = NODE_TIMEOUT_MIN_MS;
+    return t;
+}
+
 uint16_t node_check_timeouts(void)
 {
     uint16_t changed = 0;
@@ -136,10 +153,12 @@ uint16_t node_check_timeouts(void)
             continue; /* Already offline, skip */
         }
 
+        uint64_t timeout = node_timeout_ms(&s_nodes[i]);
         uint64_t elapsed = now_ms - s_nodes[i].last_seen_ms;
-        if (elapsed >= NODE_TIMEOUT_MS) {
-            ESP_LOGI(TAG, "Node 0x%02X timeout: %llu ms since last data (threshold %d ms)",
-                     s_nodes[i].id, elapsed, NODE_TIMEOUT_MS);
+        if (elapsed >= timeout) {
+            ESP_LOGI(TAG, "Node 0x%02X timeout: %llu ms since last data "
+                     "(threshold %llu ms, sleep_interval=%d s)",
+                     s_nodes[i].id, elapsed, timeout, s_nodes[i].sleep_interval_s);
             s_nodes[i].online = false;
             changed |= (1 << i);
         }
@@ -289,6 +308,18 @@ uint8_t node_get_delta_threshold(uint8_t id, uint8_t type)
         case DELTA_TYPE_BATTERY:     return node->delta_battery;
         default:                     return 0;
     }
+}
+
+void node_set_sleep_interval(uint8_t id, uint16_t seconds)
+{
+    node_entry_t *node = node_find_or_create(id);
+    if (!node) return;
+
+    if (seconds < 5)   seconds = 5;
+    if (seconds > 3600) seconds = 3600;
+    node->sleep_interval_s = seconds;
+    ESP_LOGI(TAG, "Node 0x%02X sleep interval set to %d s (offline timeout ~%llu s)",
+             id, seconds, (unsigned long long)node_timeout_ms(node) / 1000);
 }
 
 void node_update_last_reported(uint8_t id)

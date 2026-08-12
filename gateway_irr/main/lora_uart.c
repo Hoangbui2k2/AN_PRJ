@@ -1,9 +1,11 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "lora_uart.h"
 #include "crc.h"
 
@@ -11,6 +13,224 @@ static const char *TAG = "LORA_UART";
 
 /* Forward declaration of CRC helper used in send path */
 /* (crc8_calculate is declared in crc.h) */
+
+/* ──────────── RX frame-assembler state ────────────
+ *
+ * UART delivers bytes in bursts; several nodes may transmit back-to-back,
+ * so a single packet can arrive split across reads.  The old code read a
+ * fixed 3-byte header block: if only 1-2 bytes had arrived, those bytes were
+ * consumed and lost, and the next read slid out of frame → CRC errors and,
+ * worse, data from one node mis-attributed to another.  Instead we keep a
+ * small accumulation buffer and only consume bytes once they complete a
+ * whole valid frame.  If CRC fails, we re-sync by dropping ONE byte and
+ * trying again (handles back-to-back / boundary-corrupted frames).
+ */
+/* A node may transmit several frames back-to-back (e.g. REPORT sends data 0x01
+ * immediately followed by ACK 0x03). The assembler must be able to hold more
+ * than a single frame so a trailing frame is not dropped when the first one
+ * completes. 20 comfortably holds a compact frame (≤9B) plus a legacy frame
+ * (8B) back-to-back; legacy+legacy (16B) fits with room to spare. */
+#define RX_BUF_MAX      20
+#define RX_FRAME_LEGACY_LEN 8
+
+static uint8_t  s_rx_buf[RX_BUF_MAX];
+static int      s_rx_len = 0;
+
+/* TX mutex — serialises downlink transmits across tasks (lora_rx/worker,
+ * cmd_retry, MQTT callback) so two sends never interleave. */
+static SemaphoreHandle_t s_tx_mutex = NULL;
+
+/* Warning throttle — during an RF-noise / desync burst the resync loop would
+ * otherwise print one WARN per byte (hundreds of lines). Emit at most one WARN
+ * per RX_RESC_CHATTER_MS window; the rest are counted and summarized. */
+#define RX_RESC_CHATTER_MS  1000
+static uint32_t s_rx_resync_dropped = 0;
+static uint64_t s_rx_resync_last_warn_ms = 0;
+
+static void rx_resync_warn(void)
+{
+    uint64_t now = esp_timer_get_time() / 1000;
+    if (now - s_rx_resync_last_warn_ms < RX_RESC_CHATTER_MS) {
+        s_rx_resync_dropped++;
+        return;
+    }
+    if (s_rx_resync_dropped > 0) {
+        ESP_LOGW(TAG, "RX resync suppressed %lu drops in the last 1000 ms",
+                 (unsigned long)s_rx_resync_dropped);
+    }
+    s_rx_resync_dropped = 0;
+    s_rx_resync_last_warn_ms = now;
+}
+
+/* 0x05 (LORA_CMD_HEADER) is a DOWNLINK type. The E32 module reflects the
+ * gateway's own downlink transmit back onto the shared UART RX line, so we
+ * must be able to frame it (to consume the bytes) but will then discard it
+ * silently — it is never a genuine node uplink. */
+static bool rx_is_known_type(uint8_t type)
+{
+    return (type == PKT_TYPE_DATA || type == PKT_TYPE_HEARTBEAT ||
+            type == PKT_TYPE_ACK || type == PKT_TYPE_ALARM ||
+            type == PKT_TYPE_DATA_COMPACT || type == PKT_TYPE_CMD);
+}
+
+static int rx_frame_len(const uint8_t *buf)
+{
+    uint8_t type = buf[1];
+    if (!rx_is_known_type(type)) {
+        /* Unknown type byte — caller will resync */
+        return -1;
+    }
+    if (type == PKT_TYPE_CMD) {
+        return 6;            /* downlink command frame (node never sends it) */
+    }
+    if (type == PKT_TYPE_DATA_COMPACT) {
+        uint8_t presence = buf[2];
+        int n = __builtin_popcount((unsigned int)(presence & 0x1F));
+        return 3 + n + 1;   /* header + payload + crc */
+    }
+    return RX_FRAME_LEGACY_LEN;         /* legacy fixed length */
+}
+
+/* Drop the oldest byte (resync helper) */
+static void rx_drop_byte(void)
+{
+    if (s_rx_len <= 0) return;
+    memmove(&s_rx_buf[0], &s_rx_buf[1], (size_t)(s_rx_len - 1));
+    s_rx_len--;
+}
+
+/* Pull more bytes from the UART into the RX buffer (non-blocking-ish).
+ * Returns true if at least one new byte was appended. */
+static bool rx_fill(void)
+{
+    /* Only pull what fits the small accumulation buffer (one frame max).
+     * Any trailing bytes stay in the UART FIFO and are read on the next
+     * call — they are NOT lost. */
+    int want = RX_BUF_MAX - s_rx_len;
+    if (want <= 0) return false;
+
+    int n = uart_read_bytes(LORA_UART_NUM, &s_rx_buf[s_rx_len],
+                            want, pdMS_TO_TICKS(10));
+    if (n <= 0) return false;
+    s_rx_len += n;
+    return true;
+}
+
+bool lora_read_packet(lora_uplink_packet_t *packet)
+{
+    if (packet == NULL) return false;
+
+    /* Keep filling until we have at least a header, or nothing arrives. */
+    while (s_rx_len < 3) {
+        if (!rx_fill()) return false;
+    }
+
+    /* Attempt to parse a whole frame from the accumulated bytes. */
+    int attempts = 0;
+    while (attempts < RX_BUF_MAX) {    /* bounded resync loop */
+        int frame_len = rx_frame_len(s_rx_buf);
+        if (frame_len < 0) {
+            /* Unknown type byte → resync by dropping one byte. */
+            rx_resync_warn();
+            rx_drop_byte();
+            attempts++;
+            continue;
+        }
+
+        if (s_rx_len < frame_len) {
+            /* Partial frame — wait for the rest (do NOT consume partial). */
+            if (!rx_fill()) return false;
+            continue;
+        }
+
+        /* We have a full frame (s_rx_len >= frame_len). Verify CRC. */
+        uint8_t pkt[RX_BUF_MAX];
+        memcpy(pkt, s_rx_buf, (size_t)frame_len);
+
+        uint8_t computed = crc8_calculate(pkt, (size_t)(frame_len - 1));
+        if (computed != pkt[frame_len - 1]) {
+            rx_resync_warn();
+            rx_drop_byte();
+            attempts++;
+            continue;
+        }
+
+        /* Downlink echo (type 0x05 = LORA_CMD_HEADER): this is NOT an uplink
+         * from a node — it is our own command/ACK that the E32 module reflected
+         * back onto the shared RX line. Consume the 6 bytes and discard it
+         * silently; then continue parsing in case a real uplink (from the node
+         * that is currently awake) follows immediately behind it. */
+        if (pkt[1] == PKT_TYPE_CMD) {
+            int remain = s_rx_len - frame_len;
+            if (remain > 0) {
+                memmove(&s_rx_buf[0], &s_rx_buf[frame_len], (size_t)remain);
+            }
+            s_rx_len = remain;
+            ESP_LOGD(TAG, "Discarded downlink echo (cmd=0x%02X)", pkt[2]);
+            /* Keep looping: drop straight back into parsing (if any bytes are
+             * still buffered) or wait for more (the node's real uplink). */
+            if (s_rx_len >= 3) {
+                attempts = 0;   /* restart the bounded resync with fresh buffer */
+                continue;
+            }
+            return false;       /* buffer drained — caller will re-poll */
+        }
+
+        /* Valid frame — consume it and keep any trailing bytes. */
+        memset(packet, 0, sizeof(lora_uplink_packet_t));
+        packet->node_id = pkt[0];
+        packet->type    = pkt[1];
+        packet->presence = 0;
+
+        if (pkt[1] == PKT_TYPE_DATA_COMPACT) {
+            uint8_t presence = pkt[2];
+            int off = 3;
+            if (presence & PRESENCE_TEMPERATURE) {
+                packet->temp = (int8_t)(pkt[off] - 40);
+                off++;
+            }
+            if (presence & PRESENCE_HUMIDITY)    { packet->hum = pkt[off++]; }
+            if (presence & PRESENCE_SOIL_MOIST)  { packet->soil = pkt[off++]; }
+            if (presence & PRESENCE_BATTERY)     { packet->battery = pkt[off++]; }
+            if (presence & PRESENCE_FLAGS)       { packet->flags = pkt[off++]; }
+            packet->crc = pkt[frame_len - 1];
+            packet->presence = presence;
+
+            ESP_LOGD(TAG, "LoRa RX compact: Node=0x%02X Presence=0x%02X "
+                     "Soil=%d Temp=%d Hum=%d Batt=%d Flags=0x%02X CRC=0x%02X",
+                     packet->node_id, presence, packet->soil, packet->temp,
+                     packet->hum, packet->battery, packet->flags, packet->crc);
+        } else {
+            packet->flags   = pkt[2];
+            packet->soil    = pkt[3];
+            /* Legacy: node encodes temp = temp°C + 40 (unsigned byte). */
+            packet->temp    = (int8_t)(pkt[4] - 40);
+            packet->hum     = pkt[5];
+            packet->battery = pkt[6];
+            packet->crc     = pkt[7];
+
+            ESP_LOGD(TAG, "LoRa RX: Node=0x%02X Type=0x%02X Flags=0x%02X "
+                     "Soil=%d Temp=%d Hum=%d Batt=%d CRC=0x%02X",
+                     packet->node_id, pkt[1], packet->flags, packet->soil,
+                     packet->temp, packet->hum, packet->battery, packet->crc);
+        }
+
+        /* Consume frame_len bytes from the accumulation buffer. */
+        int remain = s_rx_len - frame_len;
+        if (remain > 0) {
+            memmove(&s_rx_buf[0], &s_rx_buf[frame_len], (size_t)remain);
+        }
+        s_rx_len = remain;
+
+        return true;
+    }
+
+    /* Could not find a valid frame (many resyncs). Flush and restart. */
+    ESP_LOGW(TAG, "RX failed to resync after %d bytes, flushing", s_rx_len);
+    s_rx_len = 0;
+    lora_flush_rx();
+    return false;
+}
 
 esp_err_t lora_uart_init(void)
 {
@@ -78,6 +298,12 @@ esp_err_t lora_uart_init(void)
     /* Set module to normal mode */
     lora_set_mode(LORA_MODE_NORMAL);
 
+    /* Create the TX mutex (serialises downlink sends across tasks) */
+    if (s_tx_mutex == NULL) {
+        s_tx_mutex = xSemaphoreCreateMutex();
+        configASSERT(s_tx_mutex != NULL);
+    }
+
     /* Flush any stale data */
     uart_flush(LORA_UART_NUM);
 
@@ -123,142 +349,6 @@ bool lora_wait_aux_ready(uint32_t timeout_ms)
     return false;
 }
 
-bool lora_read_packet(lora_uplink_packet_t *packet)
-{
-    /* Read minimum header: node_id(1) + type(1) + third_byte(1) */
-    uint8_t header[3];
-    int len = uart_read_bytes(LORA_UART_NUM, header, 3, pdMS_TO_TICKS(50));
-    if (len != 3) {
-        return false;
-    }
-
-    uint8_t type = header[1];
-
-    /* Validate packet type */
-    if (type != PKT_TYPE_DATA && type != PKT_TYPE_HEARTBEAT &&
-        type != PKT_TYPE_ACK && type != PKT_TYPE_ALARM &&
-        type != PKT_TYPE_DATA_COMPACT) {
-        ESP_LOGW(TAG, "Unknown packet type 0x%02X from node 0x%02X, discarding",
-                 type, header[0]);
-        lora_flush_rx();
-        return false;
-    }
-
-    /* Zero out the packet struct */
-    memset(packet, 0, sizeof(lora_uplink_packet_t));
-    packet->node_id = header[0];
-    packet->type    = type;
-    packet->presence = 0; /* 0 = legacy, non-zero = compact presence mask */
-
-    if (type == PKT_TYPE_DATA_COMPACT) {
-        /* ── Compact variable-length packet (4-9 bytes) ── */
-        uint8_t presence = header[2];
-        int payload_count = __builtin_popcount((unsigned int)(presence & 0x1F));
-
-        if (payload_count < 0 || payload_count > 5) {
-            ESP_LOGW(TAG, "Invalid compact payload count %d (presence 0x%02X)",
-                     payload_count, presence);
-            lora_flush_rx();
-            return false;
-        }
-
-        /* Read payload (variable length) + CRC (1 byte) */
-        int remaining = payload_count + 1;
-        uint8_t payload[6];
-        int got = uart_read_bytes(LORA_UART_NUM, payload, remaining, pdMS_TO_TICKS(30));
-        if (got != remaining) {
-            ESP_LOGW(TAG, "Short compact packet: got %d, expected %d", got, remaining);
-            lora_flush_rx();
-            return false;
-        }
-
-        packet->presence = presence;
-
-        /* Parse payload fields in LSB-first order: temp → hum → soil → battery → flags */
-        int off = 0;
-        if (presence & PRESENCE_TEMPERATURE) {
-            /* Wire: stored = temp_C + 40  →  actual = byte - 40 */
-            packet->temp = (int8_t)(payload[off] - 40);
-            off++;
-        }
-        if (presence & PRESENCE_HUMIDITY) {
-            packet->hum = payload[off++];
-        }
-        if (presence & PRESENCE_SOIL_MOIST) {
-            packet->soil = payload[off++];
-        }
-        if (presence & PRESENCE_BATTERY) {
-            packet->battery = payload[off++];
-        }
-        if (presence & PRESENCE_FLAGS) {
-            packet->flags = payload[off++];
-        }
-
-        /* CRC is the last byte */
-        packet->crc = payload[payload_count];
-
-        /* Verify CRC: XOR of header(3) + payload (excluding CRC byte) */
-        uint8_t verify_buf[9];
-        verify_buf[0] = header[0];
-        verify_buf[1] = header[1];
-        verify_buf[2] = header[2];
-        memcpy(&verify_buf[3], payload, payload_count);
-        uint8_t computed = crc8_calculate(verify_buf, 3 + payload_count);
-        if (computed != packet->crc) {
-            ESP_LOGW(TAG, "CRC mismatch on compact packet: computed 0x%02X, received 0x%02X",
-                     computed, packet->crc);
-            return false;
-        }
-
-        ESP_LOGD(TAG, "LoRa RX compact: Node=0x%02X Presence=0x%02X "
-                 "Soil=%d Temp=%d Hum=%d Batt=%d Flags=0x%02X CRC=0x%02X",
-                 packet->node_id, presence,
-                 packet->soil, packet->temp, packet->hum, packet->battery,
-                 packet->flags, packet->crc);
-
-        return true;
-    } else {
-        /* ── Legacy 8-byte packet (0x01, 0x02, 0x03, 0x04) ── */
-        uint8_t rest[5];
-        int got = uart_read_bytes(LORA_UART_NUM, rest, 5, pdMS_TO_TICKS(30));
-        if (got != 5) {
-            return false;
-        }
-
-        packet->flags   = header[2];
-        packet->soil    = rest[0];
-        /* Legacy: node encodes temp = temp°C + 40 (unsigned byte). Decode back
-         * to °C (-40..+85) to stay consistent with the compact 0x06 format. */
-        packet->temp    = (int8_t)(rest[1] - 40);
-        packet->hum     = rest[2];
-        packet->battery = rest[3];
-        packet->crc     = rest[4];
-
-        /* Verify CRC: XOR of all 8 bytes before the CRC byte */
-        uint8_t verify_buf[8] = {
-            header[0], header[1], header[2],
-            rest[0], rest[1], rest[2], rest[3], rest[4]
-        };
-        uint8_t computed = crc8_calculate(verify_buf, 7);
-        if (computed != verify_buf[7]) {
-            ESP_LOGW(TAG, "CRC mismatch: computed 0x%02X, received 0x%02X "
-                     "(pkt: %02X %02X %02X %02X %02X %02X %02X %02X)",
-                     computed, verify_buf[7],
-                     verify_buf[0], verify_buf[1], verify_buf[2],
-                     verify_buf[3], verify_buf[4], verify_buf[5],
-                     verify_buf[6], verify_buf[7]);
-            return false;
-        }
-
-        ESP_LOGD(TAG, "LoRa RX: Node=0x%02X Type=0x%02X Flags=0x%02X "
-                 "Soil=%d Temp=%d Hum=%d Batt=%d CRC=0x%02X",
-                 packet->node_id, type, packet->flags,
-                 packet->soil, packet->temp, packet->hum, packet->battery, packet->crc);
-
-        return true;
-    }
-}
-
 /*
  * Shared transmit path: wait for AUX, write the raw packet, wait for the
  * UART FIFO to drain and AUX to go high again (module ready after TX).
@@ -286,6 +376,17 @@ static bool lora_transmit_packet(const uint8_t *buf, size_t len)
         ESP_LOGW(TAG, "AUX not ready after send (module may still be busy)");
     }
 
+    /* Clear any TX echo / stale bytes accumulated during transmit. The E32
+     * module may reflect (loop) our own downlink onto the shared UART RX line,
+     * corrupting the RX assembler for the next genuine uplink. Dropping those
+     * bytes here guarantees frame sync starts clean for the node's reply. */
+    if (uart_flush_input(LORA_UART_NUM) != ESP_OK) {
+        ESP_LOGW(TAG, "UART RX flush after TX failed");
+    }
+    if (s_rx_len != 0) {
+        s_rx_len = 0;   /* also clear bytes already staged in the assembler */
+    }
+
     return true;
 }
 
@@ -301,14 +402,26 @@ bool lora_send_command(uint8_t node_id, uint8_t command, uint8_t param1, uint8_t
     /* CRC is XOR of bytes 0-4, placed in byte 5 */
     buf[5] = crc8_calculate(buf, 5);
 
-    if (!lora_transmit_packet(buf, LORA_DOWNLINK_SIZE)) {
+    /* Serialise TX against other tasks sending downlinks */
+    if (s_tx_mutex != NULL &&
+        xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        ESP_LOGW(TAG, "TX mutex timeout (cmd), dropping send to node 0x%02X",
+                 node_id);
         return false;
     }
 
-    ESP_LOGD(TAG, "LoRa TX: Node=0x%02X Cmd=0x%02X P1=%d P2=%d CRC=0x%02X",
-             node_id, command, param1, param2, buf[5]);
+    bool ok = lora_transmit_packet(buf, LORA_DOWNLINK_SIZE);
 
-    return true;
+    if (s_tx_mutex != NULL) {
+        xSemaphoreGive(s_tx_mutex);
+    }
+
+    if (ok) {
+        ESP_LOGD(TAG, "LoRa TX: Node=0x%02X Cmd=0x%02X P1=%d P2=%d CRC=0x%02X",
+                 node_id, command, param1, param2, buf[5]);
+    }
+
+    return ok;
 }
 
 bool lora_send_ack(uint8_t node_id)
@@ -322,13 +435,25 @@ bool lora_send_ack(uint8_t node_id)
     buf[4] = 0;
     buf[5] = crc8_calculate(buf, 5);
 
-    if (!lora_transmit_packet(buf, LORA_DOWNLINK_SIZE)) {
+    /* Serialise against other downlink transmitters */
+    if (s_tx_mutex != NULL &&
+        xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        ESP_LOGW(TAG, "TX mutex timeout, skipping ACK to node 0x%02X", node_id);
         return false;
     }
 
-    ESP_LOGD(TAG, "LoRa TX ACK: Node=0x%02X (no command) CRC=0x%02X", node_id, buf[5]);
+    bool ok = lora_transmit_packet(buf, LORA_DOWNLINK_SIZE);
 
-    return true;
+    if (s_tx_mutex != NULL) {
+        xSemaphoreGive(s_tx_mutex);
+    }
+
+    if (ok) {
+        ESP_LOGD(TAG, "LoRa TX ACK: Node=0x%02X (no command) CRC=0x%02X",
+                 node_id, buf[5]);
+    }
+
+    return ok;
 }
 
 void lora_flush_rx(void)

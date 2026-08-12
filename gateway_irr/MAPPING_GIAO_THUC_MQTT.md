@@ -189,7 +189,7 @@ Khi MQTT vừa kết nối (tại `MQTT_EVENT_CONNECTED`), gateway publish **onl
 |---|---|---|---|
 | `on` | `duration` (s) | `{"cmd":"on","duration":60}` | Bật máy bơm N giây |
 | `off` | — | `{"cmd":"off"}` | Tắt máy bơm |
-| `set_interval` | `value` (s) | `{"cmd":"set_interval","value":300}` | Chu kỳ gửi data |
+| `set_interval` | `value` (s) | `{"cmd":"set_interval","value":300}` | Chu kỳ thức dậy |
 | `set_threshold` | `low`, `high` (%) | `{"cmd":"set_threshold","low":30,"high":70}` | Ngưỡng tuyệt đối (soil) |
 | `set_delta` | `type`, `value` | `{"cmd":"set_delta","type":0,"value":20}` | Ngưỡng delta (xem bảng dưới) |
 | `set_schedule` | `hour`, `minute` | `{"cmd":"set_schedule","hour":6,"minute":0}` | Lịch tưới tự động |

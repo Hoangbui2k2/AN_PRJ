@@ -10,11 +10,22 @@ extern "C" {
 #endif
 
 #define MAX_NODES       10
-#define NODE_TIMEOUT_MS 180000  /* 3 minutes without ANY packet (data/heartbeat) = offline */
-#define HEARTBEAT_INTERVAL_MS 60000  /* 60 seconds between node heartbeats */
+#define HEARTBEAT_INTERVAL_MS 60000  /* 60 seconds between node heartbeats (legacy/default) */
+
+/* ── Offline timeout, derived from the node's real heartbeat period ──
+ *
+ * The node sends a heartbeat every (NODE_HB_CYCLES + 1) wake cycles, where
+ * NODE_HB_CYCLES matches HEARTBEAT_CYCLES in the node firmware (= 5). The
+ * gateway computes offline timeout = 2 × heartbeat period, i.e.
+ *     timeout = sleep_interval_s × (NODE_HB_CYCLES+1) × NODE_TIMEOUT_HB_MULT
+ * so a slow/heartbeat-thin node is not marked offline before it can report.
+ */
+#define NODE_HB_CYCLES       5   /* node HEARTBEAT_CYCLES (wake cycles per heartbeat) */
+#define NODE_TIMEOUT_HB_MULT 2   /* offline after 2 missed heartbeat periods */
+#define NODE_TIMEOUT_MIN_MS  60000 /* floor: never offline sooner than 60s */
 
 /* Default report interval (seconds) — used by set_interval default */
-#define REPORT_INTERVAL_DEFAULT 300
+#define REPORT_INTERVAL_DEFAULT 10
 
 /* Default threshold values */
 #define THRESHOLD_LOW_DEFAULT   30   /* Default lower threshold (%) */
@@ -61,7 +72,9 @@ typedef struct {
 
     /* ── Intervals (seconds, defaults from config) ── */
     uint16_t report_interval;      /* Sensor report interval (seconds) */
-    uint16_t heartbeat_interval;   /* Heartbeat interval (seconds) */
+    uint16_t heartbeat_interval;   /* Heartbeat interval (seconds, legacy default) */
+    uint16_t sleep_interval_s;     /* Deep-sleep period per wake cycle (sec).
+                                    * Source for the per-node offline timeout. */
 
     /* ── Schedule & mode (defaults from config) ── */
     uint8_t  schedule_hour;        /* Default schedule hour (0-23) */
@@ -181,6 +194,18 @@ bool node_is_threshold_exceeded(uint8_t id);
  * @return true if type was valid and value was set
  */
 bool node_set_delta_threshold(uint8_t id, uint8_t type, uint8_t value);
+
+/**
+ * @brief Set the node's deep-sleep period (seconds per wake cycle)
+ *
+ * Updates node_entry.sleep_interval_s which drives the per-node offline
+ * timeout (see NODE_HB_CYCLES / NODE_TIMEOUT_HB_MULT). Called when the
+ * server sends set_interval so the timeout follows the node.
+ *
+ * @param id Node ID
+ * @param seconds Sleep period in seconds (clamped 5..3600)
+ */
+void node_set_sleep_interval(uint8_t id, uint16_t seconds);
 
 /**
  * @brief Get the delta threshold value for a given type

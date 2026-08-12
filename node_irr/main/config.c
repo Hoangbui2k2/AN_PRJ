@@ -29,6 +29,8 @@ void config_init_default(void)
     rtc_config.thresholdExceeded = false;
     rtc_config.cyclesSinceSend = 0;
     rtc_config.alarmCode = ALARM_NONE;
+    rtc_config.lastAlarmCode = ALARM_NONE;
+    rtc_config.persistedAlarmCode = ALARM_NONE;
     rtc_config.totalPumpCycles = 0;
     rtc_config.lastScheduleTime = 0;
     rtc_config.pumpBySchedule = false;
@@ -71,6 +73,12 @@ void config_set_alarm(uint8_t alarm)
     if (rtc_config.alarmCode != alarm) {
         rtc_config.alarmCode = alarm;
         ESP_LOGI(TAG, "Alarm set to: 0x%02X", alarm);
+        /* Snapshot the active alarm into persisted storage so a later
+         * power-loss / cold-boot knows the alarm was active. */
+        if (alarm != ALARM_NONE) {
+            rtc_config.persistedAlarmCode = alarm;
+            save_alarm_state_to_nvs();
+        }
     }
 }
 
@@ -79,6 +87,40 @@ void config_clear_alarm(void)
     if (rtc_config.alarmCode != ALARM_NONE) {
         ESP_LOGI(TAG, "Clearing active alarm (0x%02X)", rtc_config.alarmCode);
         rtc_config.alarmCode = ALARM_NONE;
+        /* persistedAlarmCode intentionally left untouched here — it records
+         * the alarm that was active (for post-boot comparison) and is only
+         * reset once recovery has run. */
+    }
+}
+
+uint8_t config_get_alarm(void)
+{
+    return rtc_config.alarmCode;
+}
+
+uint8_t config_get_last_alarm(void)
+{
+    return rtc_config.lastAlarmCode;
+}
+
+void config_set_last_alarm(uint8_t code)
+{
+    if (rtc_config.lastAlarmCode != code) {
+        rtc_config.lastAlarmCode = code;
+        save_alarm_state_to_nvs();   /* persist to flash (save-on-change) */
+    }
+}
+
+uint8_t config_get_persisted_alarm(void)
+{
+    return rtc_config.persistedAlarmCode;
+}
+
+void config_set_persisted_alarm(uint8_t code)
+{
+    if (rtc_config.persistedAlarmCode != code) {
+        rtc_config.persistedAlarmCode = code;
+        save_alarm_state_to_nvs();
     }
 }
 
@@ -447,4 +489,56 @@ void config_set_thresholds(uint8_t low, uint8_t high)
     rtc_config.thresholdHigh = high;
     ESP_LOGI(TAG, "Thresholds set to: Low=%u%%, High=%u%%", low, high);
     save_threshold_to_nvs();
+}
+
+/* ──────────── Alarm state persistence (NVS) ────────────
+ *
+ * Save the alarm snapshot (persistedAlarmCode) and the last-reported code so
+ * a cold boot / power loss can restore what the gateway already knows.
+ * IMPORTANT: this needs NVS initialised. It is called from app_main after
+ * nvs_flash_init (config.c functions only; see main.c Step 0/3). */
+#define NVS_ALARM_PERSIST_KEY "alarm_persist"
+#define NVS_ALARM_LAST_KEY    "alarm_last"
+
+void save_alarm_state_to_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("node", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open for alarm write failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    nvs_set_u8(handle, NVS_ALARM_PERSIST_KEY, rtc_config.persistedAlarmCode);
+    nvs_set_u8(handle, NVS_ALARM_LAST_KEY,    rtc_config.lastAlarmCode);
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS commit alarm state failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Alarm state saved: persist=0x%02X last=0x%02X",
+                 rtc_config.persistedAlarmCode, rtc_config.lastAlarmCode);
+    }
+    nvs_close(handle);
+}
+
+void load_alarm_state_from_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("node", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "NVS open for alarm read failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t val = 0;
+    if (nvs_get_u8(handle, NVS_ALARM_PERSIST_KEY, &val) == ESP_OK) {
+        rtc_config.persistedAlarmCode = val;
+    }
+    if (nvs_get_u8(handle, NVS_ALARM_LAST_KEY, &val) == ESP_OK) {
+        rtc_config.lastAlarmCode = val;
+    }
+
+    nvs_close(handle);
+    ESP_LOGI(TAG, "Alarm state loaded: persist=0x%02X last=0x%02X",
+             rtc_config.persistedAlarmCode, rtc_config.lastAlarmCode);
 }

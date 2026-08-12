@@ -20,6 +20,19 @@ static const char *TAG = "COMMANDS";
 #define ACK_SEND_RETRIES      3   /* ACK transmit retries (target < 500 ms) */
 #define PENDING_WINDOW_MS     250 /* Listen window when no uplink was just sent */
 
+/* Retry backoff between uplink attempts when no downlink was received. The
+ * delay grows with each attempt (base << attempt) so the node does not spam
+ * the air: e.g. 1000ms -> 2000ms -> 4000ms, capped at 8s. */
+#define RETRY_DELAY_BASE_MS   1000
+#define RETRY_DELAY_MAX_MS    8000
+
+static int retry_delay_ms(int attempt_no) /* 0-based */
+{
+    uint32_t d = (uint32_t)RETRY_DELAY_BASE_MS << attempt_no;
+    if (d > RETRY_DELAY_MAX_MS) d = RETRY_DELAY_MAX_MS;
+    return (int)d;
+}
+
 /* ──────────── Command Deduplication (RTC-persistent) ────────────
  *
  * The gateway sends ONE command at a time and retries (backoff 1s→16s, max 5)
@@ -140,6 +153,11 @@ static int commands_wait_downlink(const sensor_data_t *data)
         ESP_LOGI(TAG, "Valid downlink command 0x%02X - processing", cmd.cmd);
         commands_process(&cmd, data);
         config_reset_gw_lost();
+        /* Gateway is back — the GATEWAY_LOST alarm (0x05) is resolved. Clear
+         * it so the node sends the "alarm cleared" packet on the next cycle. */
+        if (config_get()->alarmCode == ALARM_GATEWAY_LOST) {
+            config_clear_alarm();
+        }
         ESP_LOGI(TAG, "gatewayLostCount reset to 0 (valid downlink)");
         return 1;
     } else if (buf[1] == PKT_TYPE_ACK && len >= 8) {
@@ -324,7 +342,7 @@ int commands_send_compact_with_ack(uint8_t node_id, const sensor_data_t *data,
         }
 
         ESP_LOGW(TAG, "No downlink after compact send (attempt %d)", UPLINK_RETRIES - retries);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(retry_delay_ms(UPLINK_RETRIES - retries - 1)));
     }
 
     if (!sent) {
@@ -568,7 +586,7 @@ int commands_send_data_with_ack(uint8_t node_id, const sensor_data_t *sensor_dat
         }
 
         ESP_LOGW(TAG, "No downlink after data send (attempt %d)", UPLINK_RETRIES - retries);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(retry_delay_ms(UPLINK_RETRIES - retries - 1)));
     }
 
     if (!sent) {
@@ -598,20 +616,11 @@ int commands_build_heartbeat_packet(uint8_t node_id, uint8_t battery,
     if (config_get()->gatewayLost)       packet->flags |= FLAG_GATEWAY_LOST;
     if (data != NULL && data->sensor_error == 0) packet->flags |= FLAG_SENSOR_OK;
 
-    /* Include current readings (8-byte heartbeat format) */
-    if (data != NULL) {
-        float t = data->temperature;
-        if (t < -40.0f) t = -40.0f;
-        if (t > 85.0f)  t = 85.0f;
-        packet->temp = (uint8_t)(t + 40.0f);
-
-        float h = data->humidity;
-        if (h < 0.0f)   h = 0.0f;
-        if (h > 100.0f) h = 100.0f;
-        packet->humidity = (uint8_t)h;
-
-        packet->soil_moist = data->soil_moisture_pct;
-    }
+    /* Heartbeat carries only flags + battery (spec: soil/temp/hum = 0) —
+     * it is a liveness signal, sensor data goes out via data packets. */
+    packet->soil_moist = 0;
+    packet->temp = 0;
+    packet->humidity = 0;
 
     packet->battery = battery;
     packet->crc = crc8_xor((uint8_t *)packet, 7);
@@ -649,7 +658,7 @@ int commands_send_heartbeat(uint8_t node_id, uint8_t battery, const sensor_data_
         }
 
         ESP_LOGW(TAG, "No downlink after heartbeat (attempt %d)", UPLINK_RETRIES - retries);
-        vTaskDelay(pdMS_TO_TICKS(300));
+        vTaskDelay(pdMS_TO_TICKS(retry_delay_ms(UPLINK_RETRIES - retries - 1)));
     }
 
     if (!sent) {
@@ -681,16 +690,34 @@ int commands_send_alarm(uint8_t node_id, uint8_t alarm_code, const sensor_data_t
         return -1;
     }
 
-    ESP_LOGI(TAG, "Sending ALARM packet (0x04, code: 0x%02X)", alarm_code);
-    lora_flush();
-    if (lora_send((uint8_t *)&alarm_pkt, sizeof(alarm_pkt)) != sizeof(alarm_pkt)) {
-        ESP_LOGE(TAG, "Alarm send failed");
-        return -1;
+    /* Alarm packets are fire-and-forget, but we retry a couple of times to make
+     * sure the gateway actually received the event (reliability vs. RF loss).
+     * We stop as soon as we get any downlink ACK from the gateway. */
+    const int ALARM_SEND_RETRIES = 3;
+
+    for (int i = 0; i < ALARM_SEND_RETRIES; i++) {
+        ESP_LOGI(TAG, "Sending ALARM packet (0x04, code: 0x%02X) attempt %d/%d",
+                 alarm_code, i + 1, ALARM_SEND_RETRIES);
+
+        lora_flush();
+        if (lora_send((uint8_t *)&alarm_pkt, sizeof(alarm_pkt)) != sizeof(alarm_pkt)) {
+            ESP_LOGW(TAG, "Alarm send failed (attempt %d)", i + 1);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /* Spec D: after alarm, wait for downlink and ACK any pending command.
+         * A received downlink also proves the gateway is alive/reachable. */
+        if (commands_wait_downlink(data) == 1) {
+            return 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(retry_delay_ms(i)));
     }
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    /* Spec D: after alarm, wait for downlink and ACK any pending command */
-    commands_wait_downlink(data);
-    return 0;
+
+    ESP_LOGW(TAG, "Alarm 0x%02X sent %d times without downlink ACK", alarm_code,
+             ALARM_SEND_RETRIES);
+    return 0;   /* Not fatal — alarm is fire-and-forget */
 }
 
 int commands_check_pending(const sensor_data_t *data)

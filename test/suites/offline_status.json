@@ -1,0 +1,17 @@
+{
+  "name": "offline_status",
+  "description": "TC-C3: Node offline sau 180s timeout → gateway publish status offline. (Chạy khi node đã dừng gửi.)",
+  "timeout_seconds": 220,
+  "steps": [
+    {
+      "name": "Chờ status offline node 0x01 (180-190s)",
+      "action": "expect",
+      "timeout": 200,
+      "expect_msg": {
+        "topic_regex": "node_01/status$",
+        "schema": "status",
+        "expect": {"node": 1, "status": "offline"}
+      }
+    }
+  ]
+}

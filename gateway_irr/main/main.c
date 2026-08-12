@@ -20,6 +20,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_event.h"
@@ -65,6 +66,17 @@ static const int WIFI_FAIL_BIT      = BIT1;
 
 static gateway_config_t s_config;
 static int s_retry_num = 0;
+
+/* ──────────── RX uplink queue (producer/consumer) ────────────
+ *
+ * lora_rx_task (producer) reads frames off the UART and pushes each one onto
+ * this queue. lora_worker_task (consumer) pops them and runs
+ * process_node_packet() — including MQTT publish and any downlink reply.
+ * Decoupling the two means a slow publish/downlink never blocks RX, so
+ * packets from other nodes are not lost or mis-attributed.
+ */
+#define RX_QUEUE_LEN  32
+static QueueHandle_t s_rx_queue = NULL;
 
 /* ---------------------------- WiFi Management ---------------------------- */
 
@@ -220,9 +232,17 @@ static void publish_node_alarm_code(uint8_t node_id, uint8_t alarm_code, uint8_t
     if (!root) return;
 
     cJSON_AddNumberToObject(root, "node", node_id);
-    cJSON_AddNumberToObject(root, "alarm_code", alarm_code);
-    cJSON_AddStringToObject(root, "type", "alarm");
-    cJSON_AddStringToObject(root, "message", alarm_code_to_message(alarm_code));
+
+    if (alarm_code == 0x00) {
+        /* Node reported that its alarm cleared. */
+        cJSON_AddNumberToObject(root, "alarm_code", 0x00);
+        cJSON_AddStringToObject(root, "type", "alarm_cleared");
+        cJSON_AddStringToObject(root, "message", "Node alarm cleared");
+    } else {
+        cJSON_AddNumberToObject(root, "alarm_code", alarm_code);
+        cJSON_AddStringToObject(root, "type", "alarm");
+        cJSON_AddStringToObject(root, "message", alarm_code_to_message(alarm_code));
+    }
     cJSON_AddNumberToObject(root, "flags", flags);
 
     char *json_str = cJSON_PrintUnformatted(root);
@@ -399,7 +419,9 @@ static void process_node_packet(const lora_uplink_packet_t *pkt)
                      alarm_code, pkt->soil);
         }
 
-        if (alarm_code >= 0x01 && alarm_code <= 0x05) {
+        if (alarm_code == 0x00) {
+            ESP_LOGI(TAG, "ALARM CLEARED from node 0x%02X", pkt->node_id);
+        } else if (alarm_code >= 0x01 && alarm_code <= 0x05) {
             ESP_LOGI(TAG, "ALARM [0x%02X] from node 0x%02X: %s",
                      alarm_code, pkt->node_id, alarm_code_to_message(alarm_code));
         } else {
@@ -617,12 +639,22 @@ static void handle_mqtt_command(uint8_t node_id, const char *payload, size_t len
     switch (lora_cmd_byte) {
         case LORA_CMD_SET_INTERVAL: {
             cJSON *val = cJSON_GetObjectItem(root, "value");
+            uint32_t sleep_s;
             if (val && cJSON_IsNumber(val)) {
-                param1 = (uint8_t)(val->valueint & 0xFF);
+                sleep_s = (uint32_t)val->valueint;
             } else {
                 /* Default: node's configured report interval */
-                param1 = (uint8_t)(defaults.report_interval & 0xFF);
+                sleep_s = defaults.report_interval;
             }
+            /* Interval is a 16-bit value on the node side: low byte in param1,
+             * high byte in param2 (node decodes `param1 | (param2 << 8)`). */
+            param1 = (uint8_t)(sleep_s & 0xFF);
+            param2 = (uint8_t)((sleep_s >> 8) & 0xFF);
+            /* Keep the node entry's deep-sleep period in sync with the server
+             * so the per-node offline timeout tracks the new interval. */
+            node_set_sleep_interval(node_id, (uint16_t)sleep_s);
+            ESP_LOGI(TAG, "set_interval: node 0x%02X sleep=%lu s (wire=%d,%d)",
+                     node_id, (unsigned long)sleep_s, param1, param2);
             break;
         }
         case LORA_CMD_ON: {
@@ -704,55 +736,26 @@ static void handle_mqtt_command(uint8_t node_id, const char *payload, size_t len
 
     cJSON_Delete(root);
 
-    /* Check if node is online */
-    node_entry_t *node = node_find(node_id);
-
-    if (node && node->online) {
-        /* Send command directly with retry */
-        ESP_LOGI(TAG, "Node 0x%02X online, sending command 0x%02X", node_id, lora_cmd_byte);
-
-        bool sent = false;
-        for (int attempt = 0; attempt < MAX_RETRY; attempt++) {
-            if (lora_send_command(node_id, lora_cmd_byte, param1, param2)) {
-                sent = true;
-                ESP_LOGI(TAG, "Command 0x%02X sent to node 0x%02X (attempt %d/%d)",
-                         lora_cmd_byte, node_id, attempt + 1, MAX_RETRY);
-                break;
-            }
-            /* Exponential backoff: 1s, 2s, 4s, 8s, 16s */
-            int delay_ms = 1000 << attempt;
-            if (delay_ms > 16000) delay_ms = 16000;
-            ESP_LOGW(TAG, "Send attempt %d/%d failed, retrying in %d ms",
-                     attempt + 1, MAX_RETRY, delay_ms);
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-        }
-
-        if (!sent) {
-            ESP_LOGW(TAG, "Failed to send command to node 0x%02X after %d attempts, caching",
-                     node_id, MAX_RETRY);
-            /* Build the raw command packet for caching */
-            uint8_t cmd_pkt[6];
-            cmd_pkt[0] = node_id;
-            cmd_pkt[1] = LORA_CMD_HEADER;
-            cmd_pkt[2] = lora_cmd_byte;
-            cmd_pkt[3] = param1;
-            cmd_pkt[4] = param2;
-            cmd_pkt[5] = crc8_calculate(cmd_pkt, 5);
-            command_cache_add(node_id, cmd_pkt);
-        }
-    } else {
-        /* Node offline, cache the command */
-        ESP_LOGW(TAG, "Node 0x%02X offline, caching command 0x%02X", node_id, lora_cmd_byte);
-        
-        uint8_t cmd_pkt[6];
-        cmd_pkt[0] = node_id;
-        cmd_pkt[1] = LORA_CMD_HEADER;
-        cmd_pkt[2] = lora_cmd_byte;
-        cmd_pkt[3] = param1;
-        cmd_pkt[4] = param2;
-        cmd_pkt[5] = crc8_calculate(cmd_pkt, 5);
-        command_cache_add(node_id, cmd_pkt);
-    }
+    /* Build the raw 6-byte command packet.
+     *
+     * IMPORTANT: every server command is cached FIRST and only actually sent
+     * when the node is truly awake — i.e. when it transmits an uplink
+     * (data/heartbeat/alarm) and ack_or_flush_node() flushes the queue. We do
+     * NOT try to send right here, because the node may be mid deep-sleep:
+     * pushing a downlink then would either time out the LoRa retry loop
+     * (blocking the MQTT task up to ~31s) or miss the node's listen window
+     * entirely. Caching guarantees the command is delivered on the next real
+     * contact, no matter how the sleep cycle aligns. */
+    uint8_t cmd_pkt[6];
+    cmd_pkt[0] = node_id;
+    cmd_pkt[1] = LORA_CMD_HEADER;
+    cmd_pkt[2] = lora_cmd_byte;
+    cmd_pkt[3] = param1;
+    cmd_pkt[4] = param2;
+    cmd_pkt[5] = crc8_calculate(cmd_pkt, 5);
+    command_cache_add(node_id, cmd_pkt);
+    ESP_LOGI(TAG, "Command 0x%02X cached for node 0x%02X (sent on next uplink)",
+             lora_cmd_byte, node_id);
 }
 
 /* ---------------------------- FreeRTOS Tasks ------------------------------ */
@@ -774,23 +777,16 @@ static void lora_rx_task(void *pvParameters)
     ESP_LOGI(TAG, "LoRa RX task started");
 
     while (1) {
-        /* Try to read a packet (non-blocking) */
+        /* Producer: read a frame (non-blocking) and queue it. Any packet
+         * which arrives while the queue is full is dropped — this is better
+         * than blocking RX, which would corrupt the next frame and mis-route
+         * data from other nodes. */
         if (lora_read_packet(&packet)) {
-            /* Valid packet received, process it */
-            if (packet.type == PKT_TYPE_DATA_COMPACT) {
-                ESP_LOGI(TAG, "LoRa RX compact: node=0x%02X type=0x%02X "
-                         "presence=0x%02X soil=%d temp=%d hum=%d batt=%d "
-                         "flags=0x%02X crc=0x%02X",
-                         packet.node_id, packet.type, packet.presence,
-                         packet.soil, packet.temp, packet.hum, packet.battery,
-                         packet.flags, packet.crc);
-            } else {
-                ESP_LOGI(TAG, "LoRa RX: %02X %02X %02X %02X %02X %02X %02X %02X",
-                         packet.node_id, packet.type, packet.flags,
-                         packet.soil, packet.temp, packet.hum, packet.battery, packet.crc);
+            if (s_rx_queue == NULL ||
+                xQueueSend(s_rx_queue, &packet, pdMS_TO_TICKS(10)) != pdTRUE) {
+                ESP_LOGW(TAG, "RX queue full, dropping packet (node 0x%02X type 0x%02X)",
+                         packet.node_id, packet.type);
             }
-
-            process_node_packet(&packet);
         }
 
         /* Check node timeouts every 1 second */
@@ -825,6 +821,46 @@ static void lora_rx_task(void *pvParameters)
 }
 
 /**
+ * @brief LoRa RX Worker Task (consumer)
+ *
+ * Pops valid frames off the RX queue and processes them (MQTT publish +
+ * possible downlink reply). Runs on its own task so a slow publish/downlink
+ * never blocks the UART reader, and frames are handled strictly FIFO — no
+ * interleaving of data from different nodes.
+ */
+static void lora_worker_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    lora_uplink_packet_t packet;
+
+    ESP_LOGI(TAG, "LoRa RX worker task started");
+
+    while (1) {
+        if (s_rx_queue == NULL ||
+            xQueueReceive(s_rx_queue, &packet, portMAX_DELAY) != pdTRUE) {
+            break;
+        }
+
+        /* Log the packet the same way RX used to, for tracing */
+        if (packet.type == PKT_TYPE_DATA_COMPACT) {
+            ESP_LOGI(TAG, "LoRa RX compact: node=0x%02X type=0x%02X "
+                     "presence=0x%02X soil=%d temp=%d hum=%d batt=%d "
+                     "flags=0x%02X crc=0x%02X",
+                     packet.node_id, packet.type, packet.presence,
+                     packet.soil, packet.temp, packet.hum, packet.battery,
+                     packet.flags, packet.crc);
+        } else {
+            ESP_LOGI(TAG, "LoRa RX: %02X %02X %02X %02X %02X %02X %02X %02X",
+                     packet.node_id, packet.type, packet.flags,
+                     packet.soil, packet.temp, packet.hum, packet.battery, packet.crc);
+        }
+
+        process_node_packet(&packet);
+    }
+}
+
+/**
  * @brief Command Retry Task
  * 
  * Periodically checks the command cache for commands that need retry.
@@ -837,27 +873,13 @@ static void cmd_retry_task(void *pvParameters)
     ESP_LOGI(TAG, "Command retry task started");
 
     while (1) {
-        cached_command_t *cmd = command_cache_get_retry_ready();
-        if (cmd) {
-            node_entry_t *node = node_find(cmd->node_id);
-
-            if (node && node->online) {
-                ESP_LOGI(TAG, "Retrying cached command for node 0x%02X (attempt %d/%d)",
-                         cmd->node_id, cmd->retry_count + 1, MAX_RETRY);
-
-                if (lora_send_command(cmd->cmd[0], cmd->cmd[2], 
-                                      cmd->cmd[3], cmd->cmd[4])) {
-                    /* Wait for node ACK before considering it delivered */
-                    command_cache_mark_sent(cmd);
-                } else {
-                    ESP_LOGW(TAG, "Retry send failed for node 0x%02X", cmd->node_id);
-                    command_cache_advance_retry(cmd);
-                }
-            } else {
-                /* Node still offline, advance retry timer */
-                command_cache_advance_retry(cmd);
-            }
-        }
+        /* Advance ACK-timeout / expiry bookkeeping only. Actual (re)transmission
+         * happens exclusively in send_cached_commands_for_node(), which is called
+         * from ack_or_flush_node() when the node transmits an uplink — the only
+         * moment we know the node is truly awake. We never push a downlink from
+         * here, because the node may be in deep sleep; a blind retry would only
+         * burn LoRa airtime and risk colliding with the node's listen window. */
+        command_cache_process_timeouts();
 
         vTaskDelay(pdMS_TO_TICKS(CMD_RETRY_PERIOD_MS));
     }
@@ -947,6 +969,12 @@ void app_main(void)
     /* Initialize LoRa UART module */
     ESP_ERROR_CHECK(lora_uart_init());
 
+    /* Create the RX queue (fast producer reads, worker consumes) */
+    s_rx_queue = xQueueCreate(RX_QUEUE_LEN, sizeof(lora_uplink_packet_t));
+    if (s_rx_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create RX queue");
+    }
+
     /* Initialize node manager and command cache */
     node_manager_init();
     command_cache_init();
@@ -966,14 +994,17 @@ void app_main(void)
 
     /* Create FreeRTOS tasks */
     TaskHandle_t lora_rx_handle = NULL;
+    TaskHandle_t lora_worker_handle = NULL;
     TaskHandle_t cmd_retry_handle = NULL;
     TaskHandle_t gw_status_handle = NULL;
 
-    xTaskCreate(lora_rx_task, "lora_rx", LORA_RX_STACK_SIZE, NULL, 
+    xTaskCreate(lora_rx_task, "lora_rx", LORA_RX_STACK_SIZE, NULL,
                 LORA_RX_PRIORITY, &lora_rx_handle);
-    xTaskCreate(cmd_retry_task, "cmd_retry", CMD_RETRY_STACK_SIZE, NULL, 
+    xTaskCreate(lora_worker_task, "lora_worker", LORA_RX_STACK_SIZE, NULL,
+                LORA_RX_PRIORITY, &lora_worker_handle);
+    xTaskCreate(cmd_retry_task, "cmd_retry", CMD_RETRY_STACK_SIZE, NULL,
                 CMD_RETRY_PRIORITY, &cmd_retry_handle);
-    xTaskCreate(gateway_status_task, "gw_status", LORA_RX_STACK_SIZE, NULL, 
+    xTaskCreate(gateway_status_task, "gw_status", LORA_RX_STACK_SIZE, NULL,
                 LORA_RX_PRIORITY, &gw_status_handle);
 
     ESP_LOGI(TAG, "Gateway initialization complete. All tasks running.");
