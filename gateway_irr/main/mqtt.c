@@ -7,6 +7,7 @@
 #include "mqtt.h"
 #include "topic.h"
 #include "config.h"
+#include "certs.h"
 #include "cJSON.h"
 
 static const char *TAG = "MQTT_CLI";
@@ -28,7 +29,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
 esp_err_t mqtt_app_init(const char *broker_uri, const char *username,
                         const char *password, uint32_t port,
-                        const char *site, const char *gateway_id)
+                        const char *site, const char *gateway_id,
+                        uint8_t broker_type, const char *client_id)
 {
     /* If already initialized, clean up first */
     if (s_mqtt_client) {
@@ -63,11 +65,7 @@ esp_err_t mqtt_app_init(const char *broker_uri, const char *username,
     esp_mqtt_client_config_t mqtt_cfg = { 0 };
     mqtt_cfg.broker.address.uri = uri;
 
-    /* Use the ESP x509 certificate bundle (Mozilla CAs) for server verification,
-     * required for TLS (mqtts://) brokers. */
-    mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
-
-    /* Build last will topic using topic module */
+    /* Build last will topic using topic module (shared by both broker modes) */
     {
         char will_topic[TOPIC_MAX_LEN];
         topic_build(will_topic, sizeof(will_topic),
@@ -78,12 +76,44 @@ esp_err_t mqtt_app_init(const char *broker_uri, const char *username,
         mqtt_cfg.session.last_will.msg_len = 0;
     }
 
-    /* Set credentials if provided */
-    if (username && strlen(username) > 0) {
-        mqtt_cfg.credentials.username = username;
-    }
-    if (password && strlen(password) > 0) {
-        mqtt_cfg.credentials.authentication.password = password;
+    if (broker_type == MQTT_BROKER_AWS) {
+        /* ── AWS IoT Core: mutual-TLS with X.509 certificate ──
+         * AWS does NOT support username/password. The device authenticates by
+         * presenting its client certificate + private key; the server is
+         * verified against the Amazon Root CA. All three PEMs are loaded from
+         * the dedicated `certs` NVS partition. */
+        /* Client ID must equal the IoT Thing name for policy matching. */
+        mqtt_cfg.credentials.client_id = (client_id && strlen(client_id) > 0)
+                                             ? client_id : s_gateway_id;
+
+        const char *ca = certs_get_ca();
+        const char *client_cert = certs_get_client_cert();
+        const char *client_key = certs_get_client_key();
+
+        if (!ca || !client_cert || !client_key) {
+            ESP_LOGE(TAG, "AWS mode requires CA + client cert + key in certs partition.");
+            ESP_LOGE(TAG, "Flash them using tools/gen_certs_nvs.py");
+            return ESP_ERR_INVALID_STATE;
+        }
+        mqtt_cfg.broker.verification.certificate = ca;
+        mqtt_cfg.credentials.authentication.certificate = client_cert;
+        mqtt_cfg.credentials.authentication.key = client_key;
+
+        ESP_LOGI(TAG, "Using AWS IoT Core mutual-TLS (client_id=%s)",
+                 mqtt_cfg.credentials.client_id);
+    } else {
+        /* ── HiveMQ / generic broker: username + password over TLS ──
+         * Use the ESP x509 certificate bundle (Mozilla CAs) for server
+         * verification, since these brokers present a public-CA cert. */
+        mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+
+        if (username && strlen(username) > 0) {
+            mqtt_cfg.credentials.username = username;
+        }
+        if (password && strlen(password) > 0) {
+            mqtt_cfg.credentials.authentication.password = password;
+        }
+        ESP_LOGI(TAG, "Using MQTT broker with username/password auth");
     }
 
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);

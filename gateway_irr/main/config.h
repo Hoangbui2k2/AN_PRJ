@@ -17,9 +17,14 @@ extern "C" {
 #define MAX_USERNAME_LEN 64
 #define MAX_SITE_LEN     32
 #define MAX_GW_ID_LEN    32
+#define MAX_CLIENT_ID_LEN 64
 
 /* Number of nodes pre-configured at startup */
 #define DEFAULT_NODE_COUNT 2
+
+/* MQTT broker selection (stored in NVS, switchable without reflash) */
+#define MQTT_BROKER_HIVEMQ 0   /* username/password over TLS */
+#define MQTT_BROKER_AWS    1   /* X.509 certificate (mutual TLS) */
 
 /**
  * @brief Default node configuration
@@ -54,6 +59,8 @@ typedef struct {
     char mqtt_username[MAX_USERNAME_LEN];
     char mqtt_password[MAX_USERNAME_LEN];
     uint32_t mqtt_port;
+    uint8_t mqtt_broker_type;            /**< MQTT_BROKER_HIVEMQ or MQTT_BROKER_AWS */
+    char mqtt_client_id[MAX_CLIENT_ID_LEN]; /**< MQTT client_id (= IoT Thing name for AWS) */
     node_config_t nodes[DEFAULT_NODE_COUNT]; /**< Default nodes pre-configured */
 } gateway_config_t;
 
@@ -94,6 +101,14 @@ esp_err_t config_save_mqtt(const char *broker_uri, const char *username,
  * @return esp_err_t ESP_OK on success
  */
 esp_err_t config_save_identity(const char *site, const char *gateway_id);
+
+/**
+ * @brief Save MQTT broker selection (HiveMQ vs AWS) to NVS
+ *
+ * @param broker_type MQTT_BROKER_HIVEMQ or MQTT_BROKER_AWS
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t config_save_broker_type(uint8_t broker_type);
 
 /**
  * @brief Set default configuration values

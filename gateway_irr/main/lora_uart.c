@@ -355,11 +355,14 @@ bool lora_wait_aux_ready(uint32_t timeout_ms)
  */
 static bool lora_transmit_packet(const uint8_t *buf, size_t len)
 {
+    ESP_LOGI(TAG, "TX: waiting AUX ready (AUX=%d)", gpio_get_level(LORA_AUX_GPIO));
+
     /* Wait for AUX to indicate module ready */
     if (!lora_wait_aux_ready(LORA_TX_TIMEOUT_MS)) {
         ESP_LOGW(TAG, "AUX not ready before send");
         return false;
     }
+    ESP_LOGI(TAG, "TX: AUX ready, writing %d bytes", (int)len);
 
     /* Send the packet */
     int written = uart_write_bytes(LORA_UART_NUM, (const char *)buf, len);
@@ -367,14 +370,20 @@ static bool lora_transmit_packet(const uint8_t *buf, size_t len)
         ESP_LOGE(TAG, "UART write failed: written %d, expected %d", written, (int)len);
         return false;
     }
+    ESP_LOGI(TAG, "TX: wrote %d bytes, waiting tx done", (int)len);
 
     /* Wait for transmission to complete */
-    ESP_ERROR_CHECK(uart_wait_tx_done(LORA_UART_NUM, pdMS_TO_TICKS(LORA_TX_TIMEOUT_MS)));
+    if (uart_wait_tx_done(LORA_UART_NUM, pdMS_TO_TICKS(LORA_TX_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGW(TAG, "UART TX did not drain within timeout");
+        return false;
+    }
+    ESP_LOGI(TAG, "TX: tx done, waiting AUX high");
 
     /* Wait for AUX to go high again (module ready after transmit) */
     if (!lora_wait_aux_ready(LORA_TX_TIMEOUT_MS)) {
         ESP_LOGW(TAG, "AUX not ready after send (module may still be busy)");
     }
+    ESP_LOGI(TAG, "TX: complete (AUX=%d)", gpio_get_level(LORA_AUX_GPIO));
 
     /* Clear any TX echo / stale bytes accumulated during transmit. The E32
      * module may reflect (loop) our own downlink onto the shared UART RX line,

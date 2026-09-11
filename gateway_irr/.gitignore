@@ -1,0 +1,7 @@
+# AWS certificates & generated partition image (NEVER commit secrets)
+tools/certs/
+tools/certs.bin
+tools/certs_entries.csv
+
+# ESP-IDF build artifacts
+build/

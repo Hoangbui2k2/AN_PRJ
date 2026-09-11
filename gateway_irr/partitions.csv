@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,  Size,   Flags
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+# Custom partition table adds a dedicated `certs` NVS partition so the X.509
+# client certificate / private key / CA can be flashed independently of the
+# firmware (update certs without reflashing the app).
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     ,        0x1000,
+certs,    data, nvs,     ,        0x4000,
+factory,  app,  factory, ,        1M,

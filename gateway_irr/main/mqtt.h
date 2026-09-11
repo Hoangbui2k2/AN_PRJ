@@ -24,21 +24,25 @@ typedef void (*mqtt_command_cb_t)(uint8_t node_id, const char *payload, size_t l
 
 /**
  * @brief Initialize MQTT client
- * 
+ *
  * Configures and starts the MQTT client with the given broker URI.
  * All topics are built dynamically using site + gateway_id.
- * 
+ *
  * @param broker_uri MQTT broker URI (e.g., "mqtt://test.mosquitto.org")
- * @param username MQTT username (can be NULL)
- * @param password MQTT password (can be NULL)
+ * @param username MQTT username (can be NULL; ignored in AWS cert mode)
+ * @param password MQTT password (can be NULL; ignored in AWS cert mode)
  * @param port MQTT broker port
  * @param site Site name (e.g., "factory_1")
- * @param gateway_id Gateway identifier (e.g., "gw_01")
+ * @param gateway_id Gateway identifier (e.g., "gw_01"); used to build topics
+ * @param broker_type MQTT_BROKER_HIVEMQ (user/pass) or MQTT_BROKER_AWS (cert)
+ * @param client_id MQTT client_id (in AWS mode this is the IoT Thing name,
+ *                  e.g. "gw-01"); can be NULL to fall back to gateway_id
  * @return esp_err_t ESP_OK on success
  */
 esp_err_t mqtt_app_init(const char *broker_uri, const char *username,
                         const char *password, uint32_t port,
-                        const char *site, const char *gateway_id);
+                        const char *site, const char *gateway_id,
+                        uint8_t broker_type, const char *client_id);
 
 /**
  * @brief Set the command callback for incoming MQTT messages

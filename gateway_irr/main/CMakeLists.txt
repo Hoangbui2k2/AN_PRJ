@@ -10,6 +10,7 @@ idf_component_register(
         crc.c
         config.c
         topic.c
+        certs.c
     INCLUDE_DIRS
         .
     REQUIRES

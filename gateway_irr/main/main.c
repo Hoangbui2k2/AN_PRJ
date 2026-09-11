@@ -37,6 +37,7 @@
 #include "config.h"
 #include "topic.h"
 #include "crc.h"
+#include "certs.h"
 
 /* ---------------------------- Constants ----------------------------------- */
 
@@ -48,6 +49,12 @@
 /* Task stack sizes and priorities */
 #define LORA_RX_STACK_SIZE       4096
 #define LORA_RX_PRIORITY         5
+/* The worker task runs the full uplink chain (cJSON create/print + MQTT
+ * publish + LoRa downlink ACK). 4 KiB was too small and overflowed on the
+ * first uplink (status + data + alarm publishes back-to-back) → IllegalInstruction.
+ * Give it a roomy stack; it is the busiest task in the gateway. */
+#define LORA_WORKER_STACK_SIZE   8192
+#define GATEWAY_STATUS_STACK_SIZE 6144
 #define NODE_MONITOR_STACK_SIZE  3072
 #define NODE_MONITOR_PRIORITY    4
 #define CMD_RETRY_STACK_SIZE     3072
@@ -349,13 +356,16 @@ static void send_cached_commands_for_node(uint8_t node_id)
  */
 static void ack_or_flush_node(uint8_t node_id)
 {
+    ESP_LOGI(TAG, "ack_or_flush_node: node 0x%02X, cached=%d",
+             node_id, command_cache_count_for_node(node_id));
     if (command_cache_count_for_node(node_id) > 0) {
         send_cached_commands_for_node(node_id);
     } else {
         if (lora_send_ack(node_id)) {
-            ESP_LOGD(TAG, "Sent empty ACK to node 0x%02X (no command queued)", node_id);
+            ESP_LOGI(TAG, "Sent empty ACK to node 0x%02X (no command queued)", node_id);
         }
     }
+    ESP_LOGI(TAG, "ack_or_flush_node: done for node 0x%02X", node_id);
 }
 
 static void process_node_packet(const lora_uplink_packet_t *pkt)
@@ -953,12 +963,17 @@ void app_main(void)
     }
 
     /* Initialize MQTT client (will auto-connect when WiFi is ready) */
+    if (s_config.mqtt_broker_type == MQTT_BROKER_AWS) {
+        certs_init();
+    }
     esp_err_t mqtt_ret = mqtt_app_init(s_config.mqtt_broker_uri,
                                         s_config.mqtt_username,
                                         s_config.mqtt_password,
                                         s_config.mqtt_port,
                                         s_config.site,
-                                        s_config.gateway_id);
+                                        s_config.gateway_id,
+                                        s_config.mqtt_broker_type,
+                                        s_config.mqtt_client_id);
     if (mqtt_ret != ESP_OK) {
         ESP_LOGW(TAG, "MQTT initialization failed, will retry later");
     }
@@ -1000,11 +1015,11 @@ void app_main(void)
 
     xTaskCreate(lora_rx_task, "lora_rx", LORA_RX_STACK_SIZE, NULL,
                 LORA_RX_PRIORITY, &lora_rx_handle);
-    xTaskCreate(lora_worker_task, "lora_worker", LORA_RX_STACK_SIZE, NULL,
+    xTaskCreate(lora_worker_task, "lora_worker", LORA_WORKER_STACK_SIZE, NULL,
                 LORA_RX_PRIORITY, &lora_worker_handle);
     xTaskCreate(cmd_retry_task, "cmd_retry", CMD_RETRY_STACK_SIZE, NULL,
                 CMD_RETRY_PRIORITY, &cmd_retry_handle);
-    xTaskCreate(gateway_status_task, "gw_status", LORA_RX_STACK_SIZE, NULL,
+    xTaskCreate(gateway_status_task, "gw_status", GATEWAY_STATUS_STACK_SIZE, NULL,
                 LORA_RX_PRIORITY, &gw_status_handle);
 
     ESP_LOGI(TAG, "Gateway initialization complete. All tasks running.");

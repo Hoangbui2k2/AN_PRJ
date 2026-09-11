@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define NODE_ID 0x01
+#define NODE_ID 0x02
 /* ──────────── Operation Modes ──────────── */
 typedef enum {
     MODE_MANUAL    = 0,  /* Button-only pump control */
