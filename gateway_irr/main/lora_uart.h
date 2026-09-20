@@ -20,12 +20,44 @@ extern "C" {
 /* UART Configuration */
 #define LORA_BAUD_RATE     9600
 #define LORA_BUF_SIZE      256
+/* Max time to wait for AUX to indicate the module is idle before a new send */
 #define LORA_TX_TIMEOUT_MS 100
+/* Max time to wait for AUX to be pulled LOW (module started the RF burst) */
+#define LORA_TX_BUSY_TIMEOUT_MS 100
+/* Max time to wait for AUX to return HIGH after the RF burst is finished.
+ * 9 bytes at the default air rate take well under 100 ms; give it margin. */
+#define LORA_TX_IDLE_TIMEOUT_MS 300
 
 /* Packet Definitions */
-#define LORA_UPLINK_SIZE   8   /* Uplink packet size (Node -> Gateway) */
-#define LORA_DOWNLINK_SIZE 6   /* Downlink packet size (Gateway -> Node) */
+#define LORA_UPLINK_SIZE   8   /* Uplink packet size (Node -> Gateway, legacy/ACK) */
+#define LORA_DOWNLINK_SIZE 7   /* Downlink command size (v2: +slot byte) */
 #define LORA_CMD_HEADER    0x05 /* Command header byte for downlink */
+
+/* ── v2 packet types (slot + baseline) ── */
+#define PKT_TYPE_BASELINE      0x07  /* GW -> Node: baseline chunk (variable) */
+#define PKT_TYPE_BASELINE_DONE 0x08  /* Node -> GW: one baseline series stored */
+#define PKT_TYPE_REQ           0x09  /* Node -> GW: request (time and/or baseline) */
+
+/* Request flags (PKT_TYPE_REQ, payload byte) */
+#define REQ_FLAG_BASELINE  0x01
+#define REQ_FLAG_TIME      0x02
+
+/* Baseline series ids */
+#define BASELINE_SERIES_TEMP  0
+#define BASELINE_SERIES_HUM   1
+#define BASELINE_SERIES_SOIL  2
+#define BASELINE_SERIES_COUNT 3
+
+/* Baseline chunk sizing: header(7) + n*2 payload + crc.
+ * BASELINE_MAX_POINTS = one point per 15-minute slot (96 slots/day). Points are
+ * sparse: fewer than 96 entries is normal and interpolation fills the gaps. */
+#define BASELINE_MAX_POINTS        96
+#define BASELINE_POINTS_PER_CHUNK  10
+/* Max chunk frame = dest|type|series|version|seq|total|n_points (7 B)
+ * + n_points * [t,y] (2 B each) + crc (1 B). Derived so raising
+ * BASELINE_POINTS_PER_CHUNK can never leave the buffers too small. */
+#define BASELINE_MAX_FRAME         (7 + 2 * BASELINE_POINTS_PER_CHUNK + 1)
+#define BASELINE_MAX_CHUNKS        ((BASELINE_MAX_POINTS + BASELINE_POINTS_PER_CHUNK - 1) / BASELINE_POINTS_PER_CHUNK)
 
 /* LoRa Module Mode Control (EBYTE E32 standard: M0/M1 = MD0/MD1) */
 typedef enum {
@@ -91,14 +123,19 @@ typedef struct __attribute__((packed)) {
 #define DELTA_TYPE_SOIL          2  /* param2 = % (e.g. 10) */
 #define DELTA_TYPE_BATTERY       3  /* param2 = % (e.g. 10) */
 
-/* Downlink Packet Structure (6 bytes) */
+/* Downlink Packet Structure (7 bytes, v2)
+ *   0 node_id | 1 header(0x05) | 2 command | 3 param1 | 4 param2 | 5 slot | 6 crc
+ * `slot` carries the gateway's current 15-minute slot (0..95) in EVERY
+ * downlink so the node is time-synced on any exchange.
+ */
 typedef struct __attribute__((packed)) {
-    uint8_t node_id;     /* Byte 0: Node ID */
+    uint8_t node_id;     /* Byte 0: Node ID (0xFF = broadcast) */
     uint8_t header;      /* Byte 1: Header (0x05) */
     uint8_t command;     /* Byte 2: Command byte */
     uint8_t param1;      /* Byte 3: Parameter 1 */
     uint8_t param2;      /* Byte 4: Parameter 2 */
-    uint8_t crc;         /* Byte 5: CRC8 checksum */
+    uint8_t slot;        /* Byte 5: current slot 0..95 */
+    uint8_t crc;         /* Byte 6: CRC8 checksum of bytes 0-5 */
 } lora_downlink_packet_t;
 
 /**
@@ -133,33 +170,52 @@ bool lora_read_packet(lora_uplink_packet_t *packet);
 
 /**
  * @brief Send a downlink command to a node
- * 
- * Constructs a 6-byte packet with CRC and transmits via UART.
- * Waits for AUX to indicate module is ready before sending.
- * 
- * @param node_id Target node ID
+ *
+ * Constructs a 7-byte packet (v2, includes the current slot) with CRC and
+ * transmits via UART. Waits for AUX to indicate module is ready before sending.
+ *
+ * @param node_id Target node ID (0xFF = broadcast)
  * @param command Command byte
  * @param param1 First parameter
  * @param param2 Second parameter
+ * @param slot   Current 15-minute slot (0..SLOT_MAX)
  * @return true if packet was sent successfully
- * @return false if send failed
  */
-bool lora_send_command(uint8_t node_id, uint8_t command, uint8_t param1, uint8_t param2);
+bool lora_send_command(uint8_t node_id, uint8_t command, uint8_t param1,
+                       uint8_t param2, uint8_t slot);
 
 /**
  * @brief Send an empty ACK (no command) to a node
  *
- * Builds a 6-byte downlink packet with command LORA_CMD_ACK (0x09) and
- * no parameters. Used when the gateway receives an uplink but has no
- * queued command for the node, so the node does not sit waiting for an
- * ACK (which would otherwise inflate its gatewayLostCount and eventually
- * trigger a "gateway lost" alarm).
+ * Builds a 7-byte downlink packet with command LORA_CMD_ACK (0x09) and no
+ * parameters, carrying the current slot. Used when the gateway receives an
+ * uplink but has no queued command for the node, so the node does not sit
+ * waiting for an ACK (which would otherwise inflate its gatewayLostCount and
+ * eventually trigger a "gateway lost" alarm).
  *
  * @param node_id Target node ID
+ * @param slot    Current slot 0..SLOT_MAX
  * @return true if packet was sent successfully
- * @return false if send failed
  */
-bool lora_send_ack(uint8_t node_id);
+bool lora_send_ack(uint8_t node_id, uint8_t slot);
+
+/**
+ * @brief Send one baseline chunk (type 0x07) to a node
+ *
+ * Frame: dest|0x07|series|version|seq|total|n_points|[t,y]xn|crc
+ *
+ * @param node_id  Target node ID
+ * @param series   BASELINE_SERIES_*
+ * @param version  Baseline version
+ * @param seq      Chunk index (0..total-1)
+ * @param total    Total chunks for this series
+ * @param points   Packed [t,y] pairs (2 bytes each)
+ * @param n_points Number of points in this chunk (<= BASELINE_POINTS_PER_CHUNK)
+ * @return true if packet was sent successfully
+ */
+bool lora_send_baseline_chunk(uint8_t node_id, uint8_t series, uint8_t version,
+                              uint8_t seq, uint8_t total,
+                              const uint8_t *points, uint8_t n_points);
 
 /**
  * @brief Wait for AUX pin to indicate module ready

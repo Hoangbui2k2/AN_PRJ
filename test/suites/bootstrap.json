@@ -1,6 +1,6 @@
 {
   "name": "bootstrap",
-  "description": "TC-A02/A03: Gateway boot online, hòặc heartbeat định kỳ, data schema đầu tiên.",
+  "description": "TC-A02/TC-A03 (gateway online + heartbeat 60s) + TC-B01/TC-C01 (node 0x01 gửi data schema hợp lệ).",
   "timeout_seconds": 200,
   "steps": [
     {
@@ -34,7 +34,7 @@
       }
     },
     {
-      "name": "TC-A01: node 0x01 publish data schema hợp lệ",
+      "name": "TC-B01/TC-C01: node 0x01 publish data schema hợp lệ",
       "action": "expect",
       "timeout": 60,
       "expect_msg": {

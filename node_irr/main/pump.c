@@ -2,6 +2,7 @@
 #include "config.h"
 #include "power.h"
 #include "driver/gpio.h"
+#include "esp_system.h"      /* esp_reset_reason() */
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,18 +40,34 @@ void pump_init(void)
      * cfg->pumpState while pump_on/off check s_pump_state).  Without this
      * sync, a stale value would be restored on the next wake and the pump
      * could get toggled to the wrong state.
-     *   - Deep-sleep wake: flip-flop holds its output, so restore RTC. */
+     *   - Deep-sleep wake: flip-flop holds its output, so restore RTC.
+     *   - Software reset / watchdog / panic: only the CPU restarted, the
+     *     CD4013 is still powered and holds its output → restore RTC too.
+     *     (Without this, a reset during a timed run left the firmware believing
+     *      the pump was OFF while it was physically ON — and a "pump off" could
+     *      then never reach the latch.)
+     *   - Power-on / brownout: the latch lost power → hardware default. */
     app_config_t *cfg_rtc = config_get();
     esp_sleep_wakeup_cause_t wake = power_get_wake_cause();
-    if (wake == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    esp_reset_reason_t reason = esp_reset_reason();
+
+    bool latch_held = (wake != ESP_SLEEP_WAKEUP_UNDEFINED) ||
+                      (reason == ESP_RST_SW) ||
+                      (reason == ESP_RST_PANIC) ||
+                      (reason == ESP_RST_INT_WDT) ||
+                      (reason == ESP_RST_TASK_WDT) ||
+                      (reason == ESP_RST_WDT);
+
+    if (latch_held) {
+        s_pump_state = cfg_rtc->pumpState ? 1 : 0;
+    } else {
         s_pump_state = PUMP_COLDBOOT_STATE;
         cfg_rtc->pumpState = (PUMP_COLDBOOT_STATE == 1);   /* keep RTC in sync */
-    } else {
-        s_pump_state = cfg_rtc->pumpState ? 1 : 0;
     }
 
-    ESP_LOGI(TAG, "Pump initialized, state: %s (wake: %d)",
-             s_pump_state ? "ON" : "OFF", wake);
+    ESP_LOGI(TAG, "Pump initialized, state: %s (wake: %d, reset: %d, latch %s)",
+             s_pump_state ? "ON" : "OFF", wake, reason,
+             latch_held ? "held" : "power-cycled");
 }
 
 /**

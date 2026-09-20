@@ -96,7 +96,7 @@ app_main()
 
 - `irrigation_cycle(&data)`:
   1. If `pumpBySchedule` and duration elapsed → `pump_off()`, clear flag, restore `interval = normalInterval`.
-  2. Schedule: at schedule time → `pump_on()`, set `pumpBySchedule`, temporarily `interval = scheduleDuration`.
+  2. Schedule: `t` (slot) == target slot derived from `scheduleHour/Minute` (catch-up 1 slot), once per day via the slot-day counter → `pump_on()`, set `pumpBySchedule`, temporarily `interval = scheduleDuration`.
   3. Threshold: `should_irrigate` hysteresis (`s_irrigation_active`); soil sensor failure → alarm 0x01 + fallback to `MODE_SCHEDULE`.
 
 ### commands.h / commands.c — LoRa protocol
@@ -137,8 +137,8 @@ app_main()
 | cmd | Action |
 | --- | --- |
 | 0x01 interval | `p1|(p2<<8)`, min 5s, updates `interval`+`normalInterval` |
-| 0x02 relay ON | `pump_on()`; if duration>0 → `pumpBySchedule=true`, `scheduleDuration=dur` |
-| 0x03 relay OFF | `pump_off()`, clear `pumpBySchedule` |
+| 0x02 relay ON | `pump_on()`; duration>0 → `irrigation_start_timed_run(duration)` (RTC deadline); duration=0 → `irrigation_cancel_timed_run()` (manual hold) |
+| 0x03 relay OFF | `pump_off()`, `irrigation_cancel_timed_run()` (clears deadline + restores interval) |
 | 0x04 thresholds | `config_set_thresholds(p1,p2)` + NVS save (rejects low≥high) |
 | 0x05 schedule | `config_set_schedule(p1,p2)` |
 | 0x06 report | reset gw_lost, re-read sensors if needed, send 0x01 without downlink window |

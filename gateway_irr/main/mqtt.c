@@ -65,6 +65,10 @@ esp_err_t mqtt_app_init(const char *broker_uri, const char *username,
     esp_mqtt_client_config_t mqtt_cfg = { 0 };
     mqtt_cfg.broker.address.uri = uri;
 
+    /* RX buffer phải chứa được cả bảng set_baseline (3 series × 96 điểm
+     * ≈ 2.9 KB) trong 1 lần; mặc định 1 KB sẽ chia nhỏ payload. */
+    mqtt_cfg.buffer.size = MQTT_PAYLOAD_MAX;
+
     /* Build last will topic using topic module (shared by both broker modes) */
     {
         char will_topic[TOPIC_MAX_LEN];
@@ -307,25 +311,53 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 break;
             }
 
-            /* Null-terminate the topic and data */
-            char topic[MQTT_TOPIC_MAX];
-            char data[MQTT_PAYLOAD_MAX];
-            size_t topic_len = (size_t)event->topic_len < sizeof(topic) - 1
-                               ? (size_t)event->topic_len : sizeof(topic) - 1;
-            size_t data_len = (size_t)event->data_len < sizeof(data) - 1
-                              ? (size_t)event->data_len : sizeof(data) - 1;
-            memcpy(topic, event->topic, topic_len);
-            topic[topic_len] = '\0';
-            memcpy(data, event->data, data_len);
-            data[data_len] = '\0';
+            /* A publish larger than the client's RX buffer arrives as SEVERAL
+             * MQTT_EVENT_DATA events (current_data_offset / total_data_len).
+             * Reassemble before handling, otherwise the JSON is cut in half and
+             * every fragment fails to parse. */
+            static char   rx_buf[MQTT_PAYLOAD_MAX];
+            static size_t rx_len       = 0;
+            static char   rx_topic[MQTT_TOPIC_MAX];
+            static size_t rx_topic_len = 0;
 
-            ESP_LOGI(TAG, "MQTT RX: %s => %s", topic, data);
+            if (event->current_data_offset == 0) {
+                rx_len = 0;
+                rx_topic_len = 0;
+            }
+
+            if (rx_topic_len == 0 && event->topic_len > 0) {
+                size_t tl = (size_t)event->topic_len < sizeof(rx_topic) - 1
+                            ? (size_t)event->topic_len : sizeof(rx_topic) - 1;
+                memcpy(rx_topic, event->topic, tl);
+                rx_topic[tl] = '\0';
+                rx_topic_len = tl;
+            }
+
+            size_t chunk = (size_t)event->data_len;
+            if (rx_len + chunk > sizeof(rx_buf) - 1) {
+                ESP_LOGE(TAG, "MQTT payload > %d bytes - truncating",
+                         (int)sizeof(rx_buf) - 1);
+                chunk = sizeof(rx_buf) - 1 - rx_len;
+            }
+            memcpy(&rx_buf[rx_len], event->data, chunk);
+            rx_len += chunk;
+            rx_buf[rx_len] = '\0';
+
+            int total = event->total_data_len > 0 ? event->total_data_len
+                                                  : (int)rx_len;
+            if ((int)rx_len < total) {
+                ESP_LOGD(TAG, "MQTT RX fragment %d/%d bytes",
+                         (int)rx_len, total);
+                break;                      /* chờ phần còn lại */
+            }
+
+            ESP_LOGI(TAG, "MQTT RX: %s => %s", rx_topic, rx_buf);
 
             /* Check if this is a node command topic */
-            if (strstr(topic, "/cmd") != NULL) {
-                uint8_t node_id = parse_node_id_from_topic(topic);
+            if (strstr(rx_topic, "/cmd") != NULL) {
+                uint8_t node_id = parse_node_id_from_topic(rx_topic);
                 if (node_id > 0 && s_command_cb) {
-                    s_command_cb(node_id, data, data_len);
+                    s_command_cb(node_id, rx_buf, rx_len);
                 }
             }
             break;

@@ -8,8 +8,9 @@
 #define SENSOR_POWER_GPIO    26   /* MOSFET gate to power sensors */
 #define BUTTON_GPIO          34   /* Wake button (external wake) */
 
-/* Deep sleep configuration */
-#define DEFAULT_SLEEP_SEC    300  /* 5 minutes */
+/* Deep sleep configuration. MIN/MAX must stay in sync with
+ * SLEEP_INTERVAL_MIN_S / SLEEP_INTERVAL_MAX_S in config.h. */
+#define DEFAULT_SLEEP_SEC    300  /* 5 minutes - initial default only */
 #define MIN_SLEEP_SEC        5
 #define MAX_SLEEP_SEC        3600
 
@@ -39,6 +40,13 @@ bool power_button_pressed(void);
  * Never returns - restarts on wake
  */
 void power_deep_sleep(void) __attribute__((noreturn));
+
+/**
+ * @brief Enter deep sleep for a custom duration WITHOUT changing cfg->interval.
+ *        Used to park awake shortly before the t=0 slot boundary.
+ * Never returns - restarts on wake
+ */
+void power_deep_sleep_for(uint32_t sleep_sec) __attribute__((noreturn));
 
 /**
  * @brief Get wake reason

@@ -88,6 +88,7 @@ void power_set_sleep_timer(uint32_t seconds)
     if (seconds > MAX_SLEEP_SEC) seconds = MAX_SLEEP_SEC;
     app_config_t *cfg = config_get();
     cfg->interval = seconds;
+    cfg->normalInterval = seconds;   /* keep the timed-run restore value in sync */
     config_save();
     ESP_LOGI(TAG, "Sleep timer set to %lu s", (unsigned long)seconds);
 }
@@ -101,7 +102,18 @@ esp_sleep_wakeup_cause_t power_get_wake_cause(void)
 void power_deep_sleep(void)
 {
     app_config_t *cfg = config_get();
-    uint32_t sleep_sec = cfg->interval;
+    power_deep_sleep_for(cfg->interval);
+}
+
+/**
+ * @brief Deep sleep for a custom number of seconds (does NOT change the
+ *        configured interval). Used to park awake shortly before the t=0
+ *        boundary without disturbing the configured cycle.
+ */
+void power_deep_sleep_for(uint32_t sleep_sec)
+{
+    if (sleep_sec < MIN_SLEEP_SEC) sleep_sec = MIN_SLEEP_SEC;
+    if (sleep_sec > MAX_SLEEP_SEC) sleep_sec = MAX_SLEEP_SEC;
 
     ESP_LOGI(TAG, "Entering deep sleep for %lu s", (unsigned long)sleep_sec);
 

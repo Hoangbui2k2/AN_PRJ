@@ -87,6 +87,18 @@ CONFIG_ESP_TASK_WDT=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK=n
 CONFIG_ESP_ERR_TO_NAME_LOOKUP=y
 
+# === Crash diagnostics ===
+# Keep the chip alive after a panic so the full Guru Meditation message and
+# backtrace are printed before the reboot (with 0 the reset truncates the
+# message and the serial line goes floating -> only garbage in the log).
+CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=3
+# Raise the brownout threshold so a supply sag caused by the LoRa module's RF
+# burst produces a clean brownout reset ("Brownout detector was triggered")
+# instead of letting the CPU run out of spec and execute garbage. Lower it back
+# to 0 once the power path is verified. Levels: 0=2.43 V .. 7=2.78 V.
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
+
 # === Heap Configuration ===
 CONFIG_HEAP_TRACING=n
 CONFIG_HEAP_POISONING_DISABLED=y

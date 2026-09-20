@@ -32,15 +32,25 @@ Mỗi test case có định dạng chuẩn:
 - `temp` lệch +40: `temp_byte = temperature + 40`. VD 28°C → `0x44` (68).
 - `crc` = XOR của 7 byte trước (không bỏ 0x00).
 
-**Downlink LoRa 6B (GW → Node):**
+**Downlink LoRa 7B (GW → Node) — v2, có slot:**
 
 ```
-| node_id | 0x05 | cmd | param1 | param2 | crc |
+| dest | 0x05 | cmd | param1 | param2 | slot | crc |
 ```
 
-- `crc` = XOR của 5 byte trước.
+- `crc` = XOR của **6 byte** trước.
+- `slot` = slot hiện tại của gateway (0..95), có mặt trong **mọi** downlink.
 
-**LoRa packet types (uplink):** `0x01` data, `0x02` heartbeat, `0x03` ACK, `0x04` alarm, `0x06` compact.
+> ⚠️ **Protocol đã đổi từ 6 → 7 byte** (thêm byte `slot`). Các ví dụ downlink 6 byte bên dưới
+> (như `01 05 04 14 50 44`) là **bản cũ** — bản mới chèn `slot` trước `crc`, ví dụ
+> `01 05 04 14 50 20 64` khi slot = 32. Xem chi tiết + testcase mới tại
+> [`test/BASELINE_TEST_CASES.md`](../../test/BASELINE_TEST_CASES.md).
+
+**LoRa packet types:**
+
+- Uplink (Node→GW): `0x01` data, `0x02` heartbeat, `0x03` ACK, `0x04` alarm, `0x06` compact,
+  `0x08` baseline-done, `0x09` request (flags+series_mask).
+- Downlink (GW→Node): `0x05` command (7B), `0x07` baseline chunk (variable, ≤28B).
 
 **Flags (uplink):** `0x01`=pump on, `0x02`=threshold_exceeded, `0x04`=GW_lost, `0x08`=sensor_ok.
 
@@ -231,14 +241,20 @@ Mỗi test case có định dạng chuẩn:
 ### TC-D03 — `on` với duration (60)
 - Input: `{"cmd":"on","duration":60}`.
 - Downlink: `01 05 02 3C 00 <crc>` (CMD_ON, param1=60, param2=0).
-- Node: `pump_on` + `pumpBySchedule=true; scheduleDuration=60; interval=60`.
+- Node: `pump_on()` + `irrigation_start_timed_run(60)` → log `Timed run started: 60 s (deadline on the RTC clock)`, `pumpBySchedule=true`, `interval=60`.
 - Output: data kế `pump:1`; interval tạm=60.
-- **PASS**: data `"pump":1` + node wake lại sau 60s tắt.
+- **PASS**: data `"pump":1` + node wake lại sau 60s tắt (`Timed run complete`), interval restore 300s.
+- **Thử thêm**: nhấn nút ở giây thứ 10 → node log `Timed run still active (50 s left) - pump stays ON`, pump KHÔNG tắt sớm (trừ khi đặt `BUTTON_OVERRIDES_TIMED_RUN = 1`).
 
 ### TC-D04 — off
-- Input: `{"cmd":"off"}` → downlink `01 05 03 00 00 <crc>`.
-- Node: pump_off, `pumpBySchedule=false`.
-- **PASS**: next data `"pump":0`.
+- Input: `{"cmd":"off"}` → downlink `01 05 03 00 05 <crc>`.
+- Node: `pump_off()` + `irrigation_cancel_timed_run()` → log `Timed run cancelled` (nếu đang có timed run) + `Sleep interval restored to 300 s`.
+- **PASS**: next data `"pump":0`; interval về 300s.
+
+### TC-D04b — Fallback mode chỉ từ THRESHOLD
+- Đặt `{"cmd":"set_mode","mode":0}` (MANUAL), rồi tắt gateway ≥ 3 heartbeat.
+- **PASS**: node log `Gateway lost in mode 0 - no automatic fallback (only THRESHOLD falls back to SCHEDULE)`; mode vẫn 0.
+- Lặp lại với mode 2 (THRESHOLD): log `Gateway lost in THRESHOLD mode - falling back to SCHEDULE mode`, mode = 1.
 
 ### TC-D05 — report — ép gửi data ngay
 - Input: `{"cmd":"report"}`.
@@ -287,9 +303,10 @@ Mỗi test case có định dạng chuẩn:
 - soil 75 > high70 khi đang tưới (`irrigation_active`) → `pump_off()`. Data next `pump:0`.
 
 ### TC-E03 — Schedule mode (1) + schedule duration restore
-- mode=1, schedule 06:00, duration 60, interval bình thường 300s.
-- Đến giờ: pump_on, `pump_by_schedule=true`, `interval=60`, `lastWateringDay`, hết 60s → pump_off, `interval` restore 300s. Chỉ 1 lần/ngày.
-- **PASS**: interval tạm 60 → restore; pump vào giờ schedule.
+- mode=1, schedule 06:00 → target `t = 24`, duration 60, interval bình thường 300s. Node đã sync slot.
+- Khi `t` chạm 24 (hoặc trễ nhất 1 slot): log `Schedule window hit: t=24 (target t=24 = 06:00)`, pump_on, `pumpBySchedule=true`, `interval=60`; hết 60s → pump_off, `interval` restore 300s. Chỉ 1 lần/ngày (slot-day counter).
+- **PASS**: interval tạm 60 → restore; pump bật đúng slot mục tiêu; không bật lại trong cùng ngày kể cả sau reset.
+- **Không phụ thuộc epoch**: node chỉ cần `slot_valid = true`; nếu chưa sync → log `Slot t not synced yet - schedule check skipped`.
 
 ### TC-E04 — Delta reporting compact
 - soil 50→55 (delta soil 5) → gửi compact soil.
@@ -360,7 +377,7 @@ Mỗi test case có định dạng chuẩn:
 - **PASS**: local không đổi.
 
 ### TC-G6 — Node table đầy (11 node) → từ chối thêm
-- Packet node mới đến khi đủ 10 → `Node table full, cannot add node`. không thêm.
+- Packet node mới (id 12) đến khi bảng đã đủ 11 node → `Node table full, cannot add node`. không thêm.
 
 ### TC-G7 — Compact presence=0 (không có field thay đổi)
 - Input: `01 06 00 07` (presence=0, CRC=XOR(01^06^00)=0x07).

@@ -14,7 +14,7 @@ void config_init_default(void)
 {
     ESP_LOGI(TAG, "Initializing default configuration");
     rtc_config.magic = CONFIG_MAGIC;
-    rtc_config.interval = 10;          /* 5 minutes */
+    rtc_config.interval = NODE_SLEEP_INTERVAL_S;   /* default 300 s (CMD_SET_INTERVAL can change) */
     rtc_config.thresholdLow = 30;       /* 30% soil moisture */
     rtc_config.thresholdHigh = 70;      /* 70% soil moisture */
     rtc_config.scheduleHour = 6;        /* 06:00 */
@@ -34,8 +34,8 @@ void config_init_default(void)
     rtc_config.totalPumpCycles = 0;
     rtc_config.lastScheduleTime = 0;
     rtc_config.pumpBySchedule = false;
-    rtc_config.normalInterval = 300;
-    rtc_config.lastWateringDay = 999;   /* Default to non-matching day */
+    rtc_config.normalInterval = NODE_SLEEP_INTERVAL_S;
+    rtc_config.lastWateringDay = 0xFFFF; /* Schedule never executed yet */
     rtc_config.lastSentTemp = INT8_MIN; /* Never sent */
     rtc_config.lastSentHumidity = 0;
     rtc_config.lastSentSoil = 0;
@@ -45,6 +45,15 @@ void config_init_default(void)
     rtc_config.deltaHumidity = HUM_DELTA_THRESHOLD;
     rtc_config.deltaSoil = SOIL_DELTA_THRESHOLD;
     rtc_config.deltaBattery = BATTERY_DELTA_THRESHOLD;
+
+    /* Baseline time axis — invalid until the first slot sync from the gateway.
+     * slotValid=false makes the boot flow request a time sync after any reset
+     * that clears RTC memory. */
+    rtc_config.currentSlot = 0;
+    rtc_config.slotValid = false;
+    rtc_config.slotDay = 0;
+    rtc_config.slotElapsedUs = 0;
+    rtc_config.slotErrorUs = 0;
 }
 
 bool config_load(void)
@@ -149,16 +158,47 @@ void config_set_mode(operation_mode_t mode)
 
 void config_set_sleep_time(uint16_t seconds)
 {
-    rtc_config.interval = seconds;
+    /* Clamp to the range the gateway also accepts (5 s .. 3600 s). */
+    if (seconds < SLEEP_INTERVAL_MIN_S) seconds = SLEEP_INTERVAL_MIN_S;
+    if (seconds > SLEEP_INTERVAL_MAX_S) seconds = SLEEP_INTERVAL_MAX_S;
+
+    /* Always keep the "normal" interval up to date. cfg->interval is only
+     * overwritten when NO timed run is active: during a run it holds the
+     * remaining run time, and irrigation_cancel_timed_run() restores it from
+     * normalInterval when the run finishes. */
     rtc_config.normalInterval = seconds;
-    ESP_LOGI(TAG, "Sleep interval set to: %u s (normal interval updated)", seconds);
+    if (!rtc_config.pumpBySchedule) {
+        rtc_config.interval = seconds;
+    }
+    config_save();
+
+    ESP_LOGI(TAG, "Sleep interval set to: %u s (normal=%u, active=%u, timed_run=%d)",
+             seconds, rtc_config.normalInterval, rtc_config.interval,
+             rtc_config.pumpBySchedule ? 1 : 0);
 }
 
 void config_set_schedule(uint8_t hour, uint8_t minute)
 {
+    /* The schedule runs on the fixed 15-minute time axis (t), not on an absolute
+     * clock (the node never receives an epoch — only `slot`). The requested time
+     * is therefore mapped to a slot; minutes snap DOWN to the enclosing slot
+     * (e.g. 06:20 → t=25 = 06:15).
+     * lastWateringDay is intentionally NOT re-armed here: a time that is already
+     * in the past for today will take effect at the next day boundary instead of
+     * watering immediately. */
+    uint32_t mins = (uint32_t)hour * 60u + minute;
+    uint32_t slot = mins / SLOT_MINUTES;
+    if (slot > SLOT_MAX) slot = SLOT_MAX;
+
+    if ((minute % SLOT_MINUTES) != 0) {
+        ESP_LOGW(TAG, "Schedule minute %u is not a multiple of %u — snapped to t=%lu",
+                 minute, (unsigned)SLOT_MINUTES, (unsigned long)slot);
+    }
+
     rtc_config.scheduleHour = hour;
     rtc_config.scheduleMinute = minute;
-    ESP_LOGI(TAG, "Schedule set to: %02d:%02d", hour, minute);
+    ESP_LOGI(TAG, "Schedule set to: %02u:%02u -> slot t=%lu",
+             hour, minute, (unsigned long)slot);
 }
 
 void config_reset_gw_lost(void)
@@ -220,6 +260,127 @@ void increment_cycle_counter(void)
 void reset_cycle_counter(void)
 {
     rtc_config.cyclesSinceSend = 0;
+}
+
+/* ──────────── Baseline time axis (15-minute slots) ──────────── */
+
+/* ──────────── Slot-day counter (daily schedule basis) ──────────── */
+
+/** One full lap of the 15-minute time axis = one day. Persist immediately: a
+ *  day boundary happens only ~once per 24 h, so the flash cost is negligible. */
+static void config_slot_day_bump(void)
+{
+    rtc_config.slotDay++;
+    save_schedule_state_to_nvs();
+    ESP_LOGI(TAG, "Slot day counter -> %u (t=0 wrap)", rtc_config.slotDay);
+}
+
+uint16_t config_get_slot_day(void)
+{
+    return rtc_config.slotDay;
+}
+
+uint16_t config_get_last_watering_day(void)
+{
+    return rtc_config.lastWateringDay;
+}
+
+void config_set_last_watering_day(uint16_t day)
+{
+    rtc_config.lastWateringDay = day;
+    save_schedule_state_to_nvs();
+    ESP_LOGI(TAG, "Schedule marked as executed on slot-day %u", day);
+}
+
+void config_set_current_slot(uint8_t slot)
+{
+    if (slot > SLOT_MAX) slot = SLOT_MAX;
+
+    if (!rtc_config.slotValid) {
+        ESP_LOGI(TAG, "Slot synced (first): %u", slot);
+        rtc_config.slotErrorUs = 0;
+    } else {
+        /* Measure the local estimate before overwriting it.
+         *   local   = currentSlot * SLOT_US + slotElapsedUs
+         *   gateway = slot * SLOT_US (+ an unknown fraction of the slot)
+         * phase = local − gateway. While both sides are in the SAME slot the
+         * phase is simply slotElapsedUs (0..SLOT_US). A wrapped slot-index
+         * difference `d != 0`, or a phase outside [0, SLOT_US), means the local
+         * numbering had drifted by at least one whole slot. */
+        int32_t d = (int32_t)rtc_config.currentSlot - (int32_t)slot;
+        if (d >  SLOTS_PER_DAY / 2) d -= SLOTS_PER_DAY;
+        if (d < -(SLOTS_PER_DAY / 2)) d += SLOTS_PER_DAY;
+        rtc_config.slotErrorUs = (int32_t)((int64_t)d * (int64_t)SLOT_US +
+                                           (int64_t)rtc_config.slotElapsedUs);
+
+        ESP_LOGI(TAG, "Slot sync: %u -> %u | local phase %lu ms in slot, "
+                 "slot-index delta %+d (%s)",
+                 rtc_config.currentSlot, slot,
+                 (unsigned long)(rtc_config.slotElapsedUs / 1000UL), (int)d,
+                 (d == 0 && rtc_config.slotElapsedUs < SLOT_US) ? "OK" : "DRIFT >= 1 slot");
+    }
+
+    /* Day counter: only a LARGE backward jump (typically 95 -> 0 at midnight) is
+     * a real day boundary. Small backward corrections are just the gateway
+     * pulling a slightly-ahead estimate back, and must not inflate the day. */
+    if (rtc_config.slotValid &&
+        ((int)rtc_config.currentSlot - (int)slot) > (SLOTS_PER_DAY / 2)) {
+        config_slot_day_bump();
+    }
+
+    rtc_config.currentSlot = slot;
+    rtc_config.slotValid = true;
+    rtc_config.slotElapsedUs = 0;
+}
+
+void config_advance_slot_us(uint64_t elapsed_us)
+{
+    /* Nothing to advance from until the gateway has sent a slot at least once. */
+    if (!rtc_config.slotValid) return;
+
+    /* Keep µs precision: the old second-resolution accumulator lost up to 1 s
+     * per cycle, which is ~5 minutes per day on its own. */
+    uint64_t total_us = (uint64_t)rtc_config.slotElapsedUs + elapsed_us;
+    uint32_t slots    = (uint32_t)(total_us / SLOT_US);
+    rtc_config.slotElapsedUs = (uint32_t)(total_us % SLOT_US);
+
+    if (slots) {
+        uint32_t abs_slot = (uint32_t)rtc_config.currentSlot + slots;
+        rtc_config.currentSlot = (uint8_t)(abs_slot % SLOTS_PER_DAY);
+        ESP_LOGI(TAG, "Slot advanced -> %u (+%lu ms into slot)",
+                 rtc_config.currentSlot,
+                 (unsigned long)(rtc_config.slotElapsedUs / 1000UL));
+
+        /* Every complete lap of the time axis is one day. */
+        for (uint32_t lap = abs_slot / SLOTS_PER_DAY; lap > 0; lap--) {
+            config_slot_day_bump();
+        }
+    }
+}
+
+void config_advance_slot(uint32_t elapsed_s)
+{
+    config_advance_slot_us((uint64_t)elapsed_s * 1000000ULL);
+}
+
+uint8_t config_get_slot(void)
+{
+    return rtc_config.currentSlot;
+}
+
+bool config_slot_valid(void)
+{
+    return rtc_config.slotValid;
+}
+
+uint32_t config_slot_elapsed_us(void)
+{
+    return rtc_config.slotElapsedUs;
+}
+
+int32_t config_get_slot_error_us(void)
+{
+    return rtc_config.slotErrorUs;
 }
 
 /* ──────────── Delta Threshold Checks ──────────── */
@@ -489,6 +650,57 @@ void config_set_thresholds(uint8_t low, uint8_t high)
     rtc_config.thresholdHigh = high;
     ESP_LOGI(TAG, "Thresholds set to: Low=%u%%, High=%u%%", low, high);
     save_threshold_to_nvs();
+}
+
+/* ──────────── Schedule state persistence (NVS) ────────────
+ *
+ * The daily schedule is driven by the slot-day counter on the 15-minute time
+ * axis. Persisting day + last-watered-day keeps "once per day" valid across
+ * resets and power loss (on a reset the RTC copy is gone, the NVS copy is not). */
+#define NVS_SLOT_DAY_KEY   "sch_day"
+#define NVS_LAST_WATER_KEY "sch_last"
+
+void save_schedule_state_to_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("node", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open for schedule write failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    nvs_set_u16(handle, NVS_SLOT_DAY_KEY, rtc_config.slotDay);
+    nvs_set_u16(handle, NVS_LAST_WATER_KEY, rtc_config.lastWateringDay);
+
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS commit (schedule) failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+void load_schedule_state_from_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("node", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "NVS open for schedule read failed (first boot?): %s",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    uint16_t day = 0, last = 0xFFFF;
+    bool have_day  = (nvs_get_u16(handle, NVS_SLOT_DAY_KEY, &day) == ESP_OK);
+    bool have_last = (nvs_get_u16(handle, NVS_LAST_WATER_KEY, &last) == ESP_OK);
+    nvs_close(handle);
+
+    if (have_day)  rtc_config.slotDay = day;
+    if (have_last) rtc_config.lastWateringDay = last;
+
+    if (have_day || have_last) {
+        ESP_LOGI(TAG, "Loaded schedule state from NVS: day=%u lastWateredDay=%u",
+                 rtc_config.slotDay, rtc_config.lastWateringDay);
+    }
 }
 
 /* ──────────── Alarm state persistence (NVS) ────────────

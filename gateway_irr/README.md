@@ -15,7 +15,8 @@ Firmware **ESP-IDF v5.3.1** cho ESP32 gateway cầu nối giữa các node tư�
 ## Tính năng
 
 - **Cầu nối LoRa ↔ MQTT:** nhận uplink từ node (data, heartbeat, ack, alarm), publish lên MQTT; nhận lệnh MQTT từ server, forward xuống node.
-- **Quản lý tối đa 10 nodes** (`MAX_NODES`), mặc định đăng ký 2 nodes (id 1, 2) từ config.
+- **Quản lý tối đa 11 nodes** (`MAX_NODES`), mặc định đăng ký 2 nodes (id 1, 2) từ config.
+- **Cấp baseline tuần tự**: bảng baseline (tối đa 96 điểm/series × 3 series) được gửi cho **từng node một**. Node đang giữ "lượt" (turn) nhận chunk cho tới khi xong (hoặc ngừng uplink 120 s); các node khác xếp hàng FIFO và vẫn nhận ACK rỗng.
 - **Command cache:** lệnh gửi cho node offline được cache (tối đa 20, FIFO eviction), tự động gửi khi node online trở lại.
 - **Retry với exponential backoff:** 1s → 2s → 4s → 8s → 16s, tối đa 5 lần (`MAX_RETRY`).
 - **Threshold-based reporting:** gateway kiểm tra độ ẩm đất (`soil`) so với ngưỡng `threshold_low/high`; publish alarm khi vượt ngưỡng hoặc khi node tự báo.

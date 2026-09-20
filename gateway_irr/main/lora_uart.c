@@ -28,9 +28,9 @@ static const char *TAG = "LORA_UART";
 /* A node may transmit several frames back-to-back (e.g. REPORT sends data 0x01
  * immediately followed by ACK 0x03). The assembler must be able to hold more
  * than a single frame so a trailing frame is not dropped when the first one
- * completes. 20 comfortably holds a compact frame (≤9B) plus a legacy frame
- * (8B) back-to-back; legacy+legacy (16B) fits with room to spare. */
-#define RX_BUF_MAX      20
+ * completes. It must also be able to frame the gateway's own baseline-chunk
+ * echo (up to BASELINE_MAX_FRAME = 28 bytes), hence the larger buffer. */
+#define RX_BUF_MAX      40
 #define RX_FRAME_LEGACY_LEN 8
 
 static uint8_t  s_rx_buf[RX_BUF_MAX];
@@ -70,10 +70,12 @@ static bool rx_is_known_type(uint8_t type)
 {
     return (type == PKT_TYPE_DATA || type == PKT_TYPE_HEARTBEAT ||
             type == PKT_TYPE_ACK || type == PKT_TYPE_ALARM ||
-            type == PKT_TYPE_DATA_COMPACT || type == PKT_TYPE_CMD);
+            type == PKT_TYPE_DATA_COMPACT || type == PKT_TYPE_CMD ||
+            type == PKT_TYPE_BASELINE || type == PKT_TYPE_BASELINE_DONE ||
+            type == PKT_TYPE_REQ);
 }
 
-static int rx_frame_len(const uint8_t *buf)
+static int rx_frame_len(const uint8_t *buf, int avail)
 {
     uint8_t type = buf[1];
     if (!rx_is_known_type(type)) {
@@ -81,7 +83,17 @@ static int rx_frame_len(const uint8_t *buf)
         return -1;
     }
     if (type == PKT_TYPE_CMD) {
-        return 6;            /* downlink command frame (node never sends it) */
+        return LORA_DOWNLINK_SIZE;   /* 7-byte downlink command (own echo) */
+    }
+    if (type == PKT_TYPE_BASELINE) {
+        /* Own baseline-chunk echo: need 7 header bytes to read n_points. */
+        if (avail < 7) return 0;     /* wait for more bytes */
+        uint8_t n = buf[6];
+        if (n > BASELINE_POINTS_PER_CHUNK) return -1;
+        return 7 + 2 * (int)n + 1;
+    }
+    if (type == PKT_TYPE_BASELINE_DONE || type == PKT_TYPE_REQ) {
+        return RX_FRAME_LEGACY_LEN;  /* 8-byte uplink */
     }
     if (type == PKT_TYPE_DATA_COMPACT) {
         uint8_t presence = buf[2];
@@ -99,10 +111,49 @@ static void rx_drop_byte(void)
     s_rx_len--;
 }
 
+/* ──────────── Echo guard ────────────
+ *
+ * The E32 reflects our own downlink back onto the shared UART RX line. The
+ * parser recognised those echo frames, but when an echo and the NEXT real
+ * uplink arrive close together the byte-level resync ate the real frame —
+ * observed as "gateway chỉ nhận DONE serie 0 và 2" on BOTH nodes (the middle
+ * frame of the 3 is always the one right after an echo).
+ *
+ * Therefore: ignore any RX bytes arriving in a short window right after our
+ * own UART write. An echo lands within ~15 ms of the write, while a node's
+ * reply needs >= 80 ms (air time + node processing + its own UART), so nothing
+ * legitimate is dropped.
+ */
+#define LORA_ECHO_WINDOW_MS 50
+static int64_t s_last_tx_write_us = 0;
+
+static void rx_note_tx_write(void)
+{
+    s_last_tx_write_us = esp_timer_get_time();
+}
+
+static void rx_drop_echo(void)
+{
+    if (s_last_tx_write_us == 0) return;
+    if ((esp_timer_get_time() - s_last_tx_write_us) >
+        (int64_t)LORA_ECHO_WINDOW_MS * 1000) {
+        return;
+    }
+
+    uint8_t dump[32];
+    int d = uart_read_bytes(LORA_UART_NUM, dump, sizeof(dump), 0);
+    if (d > 0) {
+        ESP_LOGD(TAG, "Echo window: discarded %d byte(s)", d);
+    }
+}
+
 /* Pull more bytes from the UART into the RX buffer (non-blocking-ish).
  * Returns true if at least one new byte was appended. */
 static bool rx_fill(void)
 {
+    /* Bỏ qua echo của chính gateway (xem LORA_ECHO_WINDOW_MS). */
+    rx_drop_echo();
+
     /* Only pull what fits the small accumulation buffer (one frame max).
      * Any trailing bytes stay in the UART FIFO and are read on the next
      * call — they are NOT lost. */
@@ -128,7 +179,7 @@ bool lora_read_packet(lora_uplink_packet_t *packet)
     /* Attempt to parse a whole frame from the accumulated bytes. */
     int attempts = 0;
     while (attempts < RX_BUF_MAX) {    /* bounded resync loop */
-        int frame_len = rx_frame_len(s_rx_buf);
+        int frame_len = rx_frame_len(s_rx_buf, s_rx_len);
         if (frame_len < 0) {
             /* Unknown type byte → resync by dropping one byte. */
             rx_resync_warn();
@@ -137,8 +188,9 @@ bool lora_read_packet(lora_uplink_packet_t *packet)
             continue;
         }
 
-        if (s_rx_len < frame_len) {
-            /* Partial frame — wait for the rest (do NOT consume partial). */
+        if (frame_len == 0 || s_rx_len < frame_len) {
+            /* Header incomplete or partial frame — wait for the rest
+             * (do NOT consume a partial frame). */
             if (!rx_fill()) return false;
             continue;
         }
@@ -155,18 +207,18 @@ bool lora_read_packet(lora_uplink_packet_t *packet)
             continue;
         }
 
-        /* Downlink echo (type 0x05 = LORA_CMD_HEADER): this is NOT an uplink
-         * from a node — it is our own command/ACK that the E32 module reflected
-         * back onto the shared RX line. Consume the 6 bytes and discard it
+        /* Downlink echo (type 0x05 command or 0x07 baseline chunk): this is NOT
+         * an uplink from a node — it is our own frame that the E32 module
+         * reflected back onto the shared RX line. Consume it and discard it
          * silently; then continue parsing in case a real uplink (from the node
          * that is currently awake) follows immediately behind it. */
-        if (pkt[1] == PKT_TYPE_CMD) {
+        if (pkt[1] == PKT_TYPE_CMD || pkt[1] == PKT_TYPE_BASELINE) {
             int remain = s_rx_len - frame_len;
             if (remain > 0) {
                 memmove(&s_rx_buf[0], &s_rx_buf[frame_len], (size_t)remain);
             }
             s_rx_len = remain;
-            ESP_LOGD(TAG, "Discarded downlink echo (cmd=0x%02X)", pkt[2]);
+            ESP_LOGD(TAG, "Discarded downlink echo (type=0x%02X)", pkt[1]);
             /* Keep looping: drop straight back into parsing (if any bytes are
              * still buffered) or wait for more (the node's real uplink). */
             if (s_rx_len >= 3) {
@@ -335,18 +387,38 @@ void lora_set_mode(lora_mode_t mode)
              mode, gpio_get_level(LORA_MD0_GPIO), gpio_get_level(LORA_MD1_GPIO));
 }
 
-bool lora_wait_aux_ready(uint32_t timeout_ms)
+/* ──────────── AUX (module busy/ready) polling ────────────
+ *
+ * The E32 pulls AUX low while it is doing anything with the radio
+ * (receiving from air, modulating a packet) and releases it when it is idle.
+ * Polling it must *sleep* between samples: `pdMS_TO_TICKS(1)` evaluates to 0
+ * with the 100 Hz tick used by this project, and `vTaskDelay(0)` only yields —
+ * that turned this loop into a hot spin issuing a cross-core yield interrupt
+ * on every iteration, exactly while the module was busy with the RF burst.
+ * Always sleep at least one tick.
+ */
+#define LORA_POLL_TICKS ((pdMS_TO_TICKS(1) > 0) ? pdMS_TO_TICKS(1) : (TickType_t)1)
+
+static bool lora_wait_aux_level(int level, uint32_t timeout_ms)
 {
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
 
+    if (gpio_get_level(LORA_AUX_GPIO) == level) {
+        return true;    /* already there */
+    }
     while ((xTaskGetTickCount() - start) < timeout_ticks) {
-        if (gpio_get_level(LORA_AUX_GPIO) == 1) {
+        vTaskDelay(LORA_POLL_TICKS);
+        if (gpio_get_level(LORA_AUX_GPIO) == level) {
             return true;
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
     return false;
+}
+
+bool lora_wait_aux_ready(uint32_t timeout_ms)
+{
+    return lora_wait_aux_level(1, timeout_ms);
 }
 
 /*
@@ -370,46 +442,68 @@ static bool lora_transmit_packet(const uint8_t *buf, size_t len)
         ESP_LOGE(TAG, "UART write failed: written %d, expected %d", written, (int)len);
         return false;
     }
+    rx_note_tx_write();   /* bắt đầu cửa sổ bỏ echo của chính mình */
     ESP_LOGI(TAG, "TX: wrote %d bytes, waiting tx done", (int)len);
 
-    /* Wait for transmission to complete */
-    if (uart_wait_tx_done(LORA_UART_NUM, pdMS_TO_TICKS(LORA_TX_TIMEOUT_MS)) != ESP_OK) {
-        ESP_LOGW(TAG, "UART TX did not drain within timeout");
-        return false;
+    /* Wait for the bytes to leave the UART. `uart_wait_tx_done()` is not used
+     * here: it parks the task on a semaphore given by the TX_DONE ISR and the
+     * previous attempt to use it ended in a task-watchdog reset on this
+     * dual-core build. Instead wait the deterministic wire time — `len` bytes
+     * at 9600 baud with 10 bits each — with a small margin, and never less
+     * than one tick (see LORA_POLL_TICKS: pdMS_TO_TICKS() of small values is 0
+     * at 100 Hz). */
+    uint32_t wire_ms = ((uint32_t)len * 10U * 1000U) / LORA_BAUD_RATE + 5U;
+    TickType_t wire_ticks = pdMS_TO_TICKS(wire_ms);
+    if (wire_ticks == 0) {
+        wire_ticks = 1;     /* never vTaskDelay(0): it only yields */
     }
-    ESP_LOGI(TAG, "TX: tx done, waiting AUX high");
+    vTaskDelay(wire_ticks);
+    ESP_LOGI(TAG, "TX: tx done (wire wait ~%lu ms), waiting AUX low", 
+             (unsigned long)wire_ms);
+
+    /* Finish the AUX handshake started by the ready-check above: the module
+     * pulls AUX LOW while it modulates the packet and releases it when the RF
+     * burst is over. Waiting for the full low→high cycle means the next frame
+     * is never started while the previous one is still on air — overlapped
+     * frames are dropped by the node, so the command/ACK would be lost.
+     * The low edge is not mandatory (a short frame may already be on air), so
+     * a missing edge is only debug-logged — the idle wait below is what
+     * matters. */
+    if (!lora_wait_aux_level(0, LORA_TX_BUSY_TIMEOUT_MS)) {
+        ESP_LOGD(TAG, "TX: AUX stayed high (frame probably already on air)");
+    }
 
     /* Wait for AUX to go high again (module ready after transmit) */
-    if (!lora_wait_aux_ready(LORA_TX_TIMEOUT_MS)) {
+    if (!lora_wait_aux_ready(LORA_TX_IDLE_TIMEOUT_MS)) {
         ESP_LOGW(TAG, "AUX not ready after send (module may still be busy)");
     }
     ESP_LOGI(TAG, "TX: complete (AUX=%d)", gpio_get_level(LORA_AUX_GPIO));
 
-    /* Clear any TX echo / stale bytes accumulated during transmit. The E32
-     * module may reflect (loop) our own downlink onto the shared UART RX line,
-     * corrupting the RX assembler for the next genuine uplink. Dropping those
-     * bytes here guarantees frame sync starts clean for the node's reply. */
-    if (uart_flush_input(LORA_UART_NUM) != ESP_OK) {
-        ESP_LOGW(TAG, "UART RX flush after TX failed");
-    }
-    if (s_rx_len != 0) {
-        s_rx_len = 0;   /* also clear bytes already staged in the assembler */
-    }
+    /* NOTE: we deliberately do NOT call uart_flush_input() here. The E32 module
+     * reflects our own downlink (type 0x05) back onto the shared UART RX line,
+     * but the RX frame parser already recognises and discards those echo frames
+     * (see lora_read_packet). Flushing the RX queue here would race with
+     * lora_rx_task, which is simultaneously blocked in uart_read_bytes() on the
+     * same queue — resetting a queue another task is waiting on corrupts it and
+     * crashes (the IllegalInstruction / hang we saw at the first uplink). */
 
     return true;
 }
 
-bool lora_send_command(uint8_t node_id, uint8_t command, uint8_t param1, uint8_t param2)
+bool lora_send_command(uint8_t node_id, uint8_t command, uint8_t param1,
+                       uint8_t param2, uint8_t slot)
 {
-    /* Build the 6-byte downlink packet */
+    /* Build the 7-byte downlink packet:
+     *   dest | 0x05 | cmd | p1 | p2 | slot | crc */
     uint8_t buf[LORA_DOWNLINK_SIZE];
     buf[0] = node_id;
     buf[1] = LORA_CMD_HEADER;      /* 0x05 */
     buf[2] = command;
     buf[3] = param1;
     buf[4] = param2;
-    /* CRC is XOR of bytes 0-4, placed in byte 5 */
-    buf[5] = crc8_calculate(buf, 5);
+    buf[5] = (uint8_t)(slot & 0x7F);
+    /* CRC is XOR of bytes 0-5, placed in byte 6 */
+    buf[6] = crc8_calculate(buf, 6);
 
     /* Serialise TX against other tasks sending downlinks */
     if (s_tx_mutex != NULL &&
@@ -426,23 +520,68 @@ bool lora_send_command(uint8_t node_id, uint8_t command, uint8_t param1, uint8_t
     }
 
     if (ok) {
-        ESP_LOGD(TAG, "LoRa TX: Node=0x%02X Cmd=0x%02X P1=%d P2=%d CRC=0x%02X",
-                 node_id, command, param1, param2, buf[5]);
+        ESP_LOGD(TAG, "LoRa TX: Node=0x%02X Cmd=0x%02X P1=%d P2=%d Slot=%u CRC=0x%02X",
+                 node_id, command, param1, param2, buf[5], buf[6]);
     }
 
     return ok;
 }
 
-bool lora_send_ack(uint8_t node_id)
+bool lora_send_baseline_chunk(uint8_t node_id, uint8_t series, uint8_t version,
+                              uint8_t seq, uint8_t total,
+                              const uint8_t *points, uint8_t n_points)
 {
-    /* Build the 6-byte downlink ACK packet: {node, 0x05, 0x09, 0, 0, crc} */
+    if (points == NULL || n_points == 0 ||
+        n_points > BASELINE_POINTS_PER_CHUNK) {
+        return false;
+    }
+
+    uint8_t buf[BASELINE_MAX_FRAME];
+    int len = 7 + 2 * (int)n_points + 1;
+
+    buf[0] = node_id;
+    buf[1] = PKT_TYPE_BASELINE;     /* 0x07 */
+    buf[2] = series;
+    buf[3] = version;
+    buf[4] = seq;
+    buf[5] = total;
+    buf[6] = n_points;
+    memcpy(&buf[7], points, (size_t)(2 * n_points));
+    buf[len - 1] = crc8_calculate(buf, (size_t)(len - 1));
+
+    if (s_tx_mutex != NULL &&
+        xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        ESP_LOGW(TAG, "TX mutex timeout (baseline), dropping to node 0x%02X",
+                 node_id);
+        return false;
+    }
+
+    bool ok = lora_transmit_packet(buf, (size_t)len);
+
+    if (s_tx_mutex != NULL) {
+        xSemaphoreGive(s_tx_mutex);
+    }
+
+    if (ok) {
+        ESP_LOGI(TAG, "LoRa TX baseline: Node=0x%02X series=%u v%u seq=%u/%u n=%u",
+                 node_id, series, version, seq, total, n_points);
+    }
+
+    return ok;
+}
+
+bool lora_send_ack(uint8_t node_id, uint8_t slot)
+{
+    /* Build the 7-byte downlink ACK packet:
+     *   dest | 0x05 | 0x09 | 0 | 0 | slot | crc */
     uint8_t buf[LORA_DOWNLINK_SIZE];
     buf[0] = node_id;
     buf[1] = LORA_CMD_HEADER;      /* 0x05 */
     buf[2] = LORA_CMD_ACK;         /* 0x09 — no command, pure ACK */
     buf[3] = 0;
     buf[4] = 0;
-    buf[5] = crc8_calculate(buf, 5);
+    buf[5] = (uint8_t)(slot & 0x7F);
+    buf[6] = crc8_calculate(buf, 6);
 
     /* Serialise against other downlink transmitters */
     if (s_tx_mutex != NULL &&
@@ -458,8 +597,8 @@ bool lora_send_ack(uint8_t node_id)
     }
 
     if (ok) {
-        ESP_LOGD(TAG, "LoRa TX ACK: Node=0x%02X (no command) CRC=0x%02X",
-                 node_id, buf[5]);
+        ESP_LOGD(TAG, "LoRa TX ACK: Node=0x%02X slot=%u (no command) CRC=0x%02X",
+                 node_id, buf[5], buf[6]);
     }
 
     return ok;

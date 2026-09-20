@@ -123,4 +123,63 @@ int commands_send_alarm(uint8_t node_id, uint8_t alarm_code, const sensor_data_t
  */
 int commands_check_pending(const sensor_data_t *data);
 
+/**
+ * @brief Send a baseline/time request uplink (type 0x09).
+ *
+ * Frame: node|0x09|flags|series_mask|0|0|0|crc
+ *
+ * @param flags       REQ_FLAG_TIME and/or REQ_FLAG_BASELINE
+ * @param series_mask Series the node wants (bit0 temp, bit1 hum, bit2 soil)
+ * @return 0 on success, -1 on transport failure
+ */
+int commands_send_req(uint8_t flags, uint8_t series_mask);
+
+/**
+ * @brief Listen for downlink frames for up to timeout_ms during the boot sync.
+ *
+ * Handles baseline chunks (0x07), commands (0x05, incl. slot sync) and ACKs.
+ * Does not transmit anything itself — but it DOES commit a completed baseline
+ * session and send the 0x08 DONE uplinks, then returns early.
+ *
+ * @param timeout_ms Total listen time in milliseconds
+ */
+void commands_wait_baseline(uint32_t timeout_ms);
+
+/**
+ * @brief Commit a completed baseline session and report it to the gateway.
+ *
+ * Safe to call at any time: returns 0 when no session is active/incomplete or
+ * when nothing new was stored.
+ *
+ * @return bitmask of newly committed series (0 = nothing reported)
+ */
+int commands_finish_baseline_if_ready(void);
+
+/**
+ * @brief Tell the gateway a baseline series has been stored (uplink 0x08).
+ *
+ * Frame: node|0x08|series|version|0|0|0|crc
+ *
+ * @param series  BASELINE_SERIES_*
+ * @param version Baseline version stored
+ * @return 0 on success, -1 on transport failure
+ */
+/**
+ * @brief Gửi 1 frame 0x08 cho MỘT serie (giữ lại tương thích).
+ */
+int commands_send_baseline_done(uint8_t series, uint8_t version);
+
+/**
+ * @brief Gửi 1 frame 0x08 mang BITMASK nhiều serie cùng version.
+ *
+ * Trước đây mỗi serie là 1 frame riêng (3 frame liền nhau). Thực tế cho thấy
+ * frame thứ 2 của chuỗi luôn bị mất (giữa 2 frame node có ACK + echo của
+ * gateway trên kênh chung) ⇒ node chỉ được xác nhận serie 0 và 2, gateway giữ
+ * lượt rất lâu. Gộp lại còn 1 frame: chuỗi không còn "frame giữa".
+ *
+ * Quy ước trường series: 0/1/2 = một serie duy nhất; 3..7 = bitmask (bit s =
+ * serie s). Gateway vẫn publish 'done' cho TỪNG serie như cũ.
+ */
+int commands_send_baseline_done_mask(uint8_t series_mask, uint8_t version);
+
 #endif /* COMMANDS_H */

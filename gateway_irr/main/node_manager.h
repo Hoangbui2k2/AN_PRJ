@@ -9,7 +9,10 @@
 extern "C" {
 #endif
 
-#define MAX_NODES       10
+/* Maximum number of nodes this gateway can manage.
+ * NOTE: s_nodes[] and the baseline session table are sized from this, so keep
+ * the per-node RAM cost in mind (baseline session ≈ 620 B/node). */
+#define MAX_NODES       11
 #define HEARTBEAT_INTERVAL_MS 60000  /* 60 seconds between node heartbeats (legacy/default) */
 
 /* ── Offline timeout, derived from the node's real heartbeat period ──
@@ -24,8 +27,10 @@ extern "C" {
 #define NODE_TIMEOUT_HB_MULT 2   /* offline after 2 missed heartbeat periods */
 #define NODE_TIMEOUT_MIN_MS  60000 /* floor: never offline sooner than 60s */
 
-/* Default report interval (seconds) — used by set_interval default */
-#define REPORT_INTERVAL_DEFAULT 10
+/* Default report interval (seconds) — used by set_interval default.
+ * Must match the node's fixed deep-sleep period (NODE_SLEEP_INTERVAL_S = 300),
+ * because node_timeout_ms() derives the per-node offline timeout from it. */
+#define REPORT_INTERVAL_DEFAULT 300
 
 /* Default threshold values */
 #define THRESHOLD_LOW_DEFAULT   30   /* Default lower threshold (%) */

@@ -11,6 +11,7 @@
 #define SUFFIX_STATUS "status"
 #define SUFFIX_CMD    "cmd"
 #define SUFFIX_CONFIG "config"
+#define SUFFIX_BASELINE "baseline"
 
 /**
  * @brief Get the suffix string for a given topic type
@@ -18,14 +19,15 @@
 static const char* topic_suffix(topic_type_t type)
 {
     switch (type) {
-        case TOPIC_NODE_DATA:   return SUFFIX_DATA;
-        case TOPIC_NODE_ALARM:  return SUFFIX_ALARM;
-        case TOPIC_NODE_STATUS: return SUFFIX_STATUS;
-        case TOPIC_NODE_CMD:    return SUFFIX_CMD;
-        case TOPIC_GW_STATUS:   return SUFFIX_STATUS;
-        case TOPIC_GW_CONFIG:   return SUFFIX_CONFIG;
-        case TOPIC_GW_WILL:     return SUFFIX_STATUS;
-        default:                return SUFFIX_STATUS;
+        case TOPIC_NODE_DATA:     return SUFFIX_DATA;
+        case TOPIC_NODE_ALARM:    return SUFFIX_ALARM;
+        case TOPIC_NODE_STATUS:   return SUFFIX_STATUS;
+        case TOPIC_NODE_CMD:      return SUFFIX_CMD;
+        case TOPIC_NODE_BASELINE: return SUFFIX_BASELINE;
+        case TOPIC_GW_STATUS:     return SUFFIX_STATUS;
+        case TOPIC_GW_CONFIG:     return SUFFIX_CONFIG;
+        case TOPIC_GW_WILL:       return SUFFIX_STATUS;
+        default:                  return SUFFIX_STATUS;
     }
 }
 
@@ -42,6 +44,7 @@ void topic_build(char *buf, size_t buf_size,
         case TOPIC_NODE_ALARM:
         case TOPIC_NODE_STATUS:
         case TOPIC_NODE_CMD:
+        case TOPIC_NODE_BASELINE:
             snprintf(buf, buf_size, "%s/%s/%s/node_%02X/%s",
                      TOPIC_ROOT, site, gateway_id, node_id, suffix);
             break;
@@ -152,6 +155,8 @@ bool topic_parse(const char *topic, topic_info_t *info)
             info->type = TOPIC_NODE_STATUS;
         else if (strcmp(p, SUFFIX_CMD) == 0)
             info->type = TOPIC_NODE_CMD;
+        else if (strcmp(p, SUFFIX_BASELINE) == 0)
+            info->type = TOPIC_NODE_BASELINE;
         else
             return false; /* Unknown suffix */
     } else {

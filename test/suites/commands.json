@@ -1,40 +1,40 @@
 {
   "name": "commands",
-  "description": "TC-D02..D07: Gửi từng lệnh server cho node, chờ data phản hồi (chứng minh lệnh được forward & xử lý).",
+  "description": "TC-D02 (set_interval - node BỎ QUA), TC-D07 (set_mode), TC-D08 (set_delta), TC-D05 (report). Mọi lệnh đều CACHE-FIRST: gửi xuống node chỉ khi node uplink.",
   "timeout_seconds": 240,
   "steps": [
     {
-      "name": "set_interval 300s",
+      "name": "TC-D02: set_interval 300s (node IGNORED - cố định 300s, vẫn ACK)",
       "action": "publish_cmd",
       "node": 1,
       "cmd": {"cmd": "set_interval", "value": 300}
     },
     {
-      "name": "Chờ data sau set_interval",
+      "name": "TC-D02: hệ thống vẫn sống - data kế tiếp hợp lệ (chu kỳ KHÔNG đổi)",
       "action": "expect",
       "timeout": 40,
       "expect_msg": {"topic_regex": "node_01/data$", "schema": "data", "expect": {"node": 1}}
     },
     {
-      "name": "set_mode 1 (Schedule)",
+      "name": "TC-D07: set_mode 1 (Schedule)",
       "action": "publish_cmd",
       "node": 1,
       "cmd": {"cmd": "set_mode", "mode": 1}
     },
     {
-      "name": "set_delta soil = 5",
+      "name": "TC-D08: set_delta soil = 5",
       "action": "publish_cmd",
       "node": 1,
       "cmd": {"cmd": "set_delta", "type": 2, "value": 5}
     },
     {
-      "name": "report (ép gửi data ngay)",
+      "name": "TC-D05: report (ép gửi data ngay)",
       "action": "publish_cmd",
       "node": 1,
       "cmd": {"cmd": "report"}
     },
     {
-      "name": "Chờ data sau report",
+      "name": "TC-D05: data mới sau report",
       "action": "expect",
       "timeout": 25,
       "expect_msg": {"topic_regex": "node_01/data$", "schema": "data", "expect": {"node": 1}}

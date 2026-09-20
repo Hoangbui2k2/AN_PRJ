@@ -10,6 +10,7 @@ idf_component_register(
         "alarms.c"
         "irrigation.c"
         "commands.c"
+        "baseline.c"
     INCLUDE_DIRS
         "."
 )

@@ -1,12 +1,17 @@
 {
   "name": "offline_status",
-  "description": "TC-C3: Node offline sau 180s timeout → gateway publish status offline. (Chạy khi node đã dừng gửi.)",
-  "timeout_seconds": 220,
+  "description": "TC-C05 (mã cũ TC-C3): node offline theo timeout SUY RA tu chu ky ngu, KHONG con co dinh 180 s. timeout = sleep_s x (HEARTBEAT_CYCLES+1) x 2 = 300 x 6 x 2 = 3600 s (san 60 s). Chay khi node da dung gui.",
+  "timeout_seconds": 3800,
+  "notes": [
+    "Voi node sleep 300 s va HEARTBEAT_CYCLES=5: timeout ~3600 s (1 gio).",
+    "Rut ngan khi test: publish {\"cmd\":\"set_interval\",\"value\":60} cho node -> gateway cap nhat sleep_interval cua node entry -> timeout = 60*6*2 = 720 s. (Node BO QUA lenh nay, chi gateway doi timeout.)",
+    "Suite nay chay RAT LAU (~1 gio). Chi chay khi that su can verify timeout offline."
+  ],
   "steps": [
     {
-      "name": "Chờ status offline node 0x01 (180-190s)",
+      "name": "TC-C05: cho status offline node 0x01 (timeout ~3600s)",
       "action": "expect",
-      "timeout": 200,
+      "timeout": 3700,
       "expect_msg": {
         "topic_regex": "node_01/status$",
         "schema": "status",

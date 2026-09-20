@@ -1,17 +1,17 @@
 {
   "name": "set_threshold",
-  "description": "TC-D01: Server gửi set_threshold(20-80) → gateway forward LoRa → node ACK → data tiếp theo có ngưỡng mới (khi exceeded).",
+  "description": "TC-D01: Server gửi set_threshold(20-80) → gateway CACHE lệnh → flush khi node uplink → node ACK → data tiếp theo có ngưỡng mới (khi exceeded).",
   "timeout_seconds": 90,
   "steps": [
     {
-      "name": "Gửi lệnh set_threshold low=20 high=80 cho node 0x01",
+      "name": "TC-D01: gửi lệnh set_threshold low=20 high=80 cho node 0x01",
       "action": "publish_cmd",
       "node": 1,
       "cmd": {"cmd": "set_threshold", "low": 20, "high": 80},
       "expect_ack": true
     },
     {
-      "name": "Chờ 1 data mới từ node 0x01 (schema hợp lệ)",
+      "name": "TC-D01: chờ 1 data mới từ node 0x01 (schema hợp lệ)",
       "action": "expect",
       "timeout": 60,
       "expect_msg": {

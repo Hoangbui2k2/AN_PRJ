@@ -1,5 +1,7 @@
 #include "lora_uart.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -9,6 +11,34 @@ static const char *TAG = "LORA_UART";
 
 /* AUX debounce delay (module needs ~2ms after mode change) */
 #define AUX_DEBOUNCE_MS 3
+
+/* How long to probe for AUX going LOW (transmit start). Short packets at
+ * 9600 baud can be over before we ever sample the pin, so a missed LOW must
+ * NOT be treated as an error. */
+#define LORA_AUX_BUSY_PROBE_MS 20
+
+/* Current MD0/MD1 mode (0xFF = unknown). Re-selecting the same mode costs a
+ * mode-settle delay plus an AUX wait on EVERY transmit, so remember it. */
+static uint8_t s_lora_mode = 0xFF;
+
+/**
+ * @brief Millisecond delay that always actually sleeps.
+ *
+ * CONFIG_FREERTOS_HZ is 100 on this board, so pdMS_TO_TICKS(1) == 0 ticks and
+ * vTaskDelay(0) returns immediately: a "wait 1 ms" loop would spin its full
+ * iteration count in microseconds and report a bogus timeout. Sub-tick waits
+ * therefore use a busy delay, anything longer uses real ticks.
+ */
+static void lora_delay_ms(int ms)
+{
+    if (ms <= 0) return;
+    TickType_t ticks = pdMS_TO_TICKS(ms);
+    if (ticks == 0) {
+        esp_rom_delay_us((uint32_t)ms * 1000u);
+    } else {
+        vTaskDelay(ticks);
+    }
+}
 
 void lora_uart_init(void)
 {
@@ -37,6 +67,7 @@ void lora_uart_init(void)
     /* Start in normal mode */
     gpio_set_level(LORA_PIN_MD0, 0);
     gpio_set_level(LORA_PIN_MD1, 0);
+    s_lora_mode = LORA_MODE_NORMAL;
     vTaskDelay(pdMS_TO_TICKS(LORA_MODE_SWITCH_MS));
 
     /* Configure UART2 */
@@ -64,11 +95,19 @@ void lora_uart_init(void)
 
 void lora_set_mode(lora_mode_t mode)
 {
+    /* Already in this mode → nothing to do. Re-driving MD0/MD1 before every
+     * single transmit was adding a settle delay + an AUX wait (up to the full
+     * timeout) for no reason. */
+    if (s_lora_mode == (uint8_t)mode) {
+        return;
+    }
+
     uint8_t md0 = (mode >> 0) & 1;
     uint8_t md1 = (mode >> 1) & 1;
 
     gpio_set_level(LORA_PIN_MD0, md0);
     gpio_set_level(LORA_PIN_MD1, md1);
+    s_lora_mode = (uint8_t)mode;
 
     /* Wait for mode switch settling */
     vTaskDelay(pdMS_TO_TICKS(LORA_MODE_SWITCH_MS));
@@ -81,13 +120,13 @@ void lora_set_mode(lora_mode_t mode)
 
 int lora_wait_aux(int timeout_ms)
 {
-    int elapsed = 0;
-    while (elapsed < timeout_ms) {
+    int64_t start_us = esp_timer_get_time();
+
+    while ((esp_timer_get_time() - start_us) < (int64_t)timeout_ms * 1000) {
         if (gpio_get_level(LORA_PIN_AUX) == 1) {
             return 0;
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
-        elapsed++;
+        lora_delay_ms(1);
     }
     ESP_LOGW(TAG, "AUX timeout after %d ms", timeout_ms);
     return -1;
@@ -106,31 +145,31 @@ int lora_wait_aux(int timeout_ms)
  */
 static int lora_wait_tx_complete(int busy_timeout_ms, int idle_timeout_ms)
 {
-    int elapsed;
+    int64_t start_us;
 
-    /* 1) Wait for AUX → LOW  — module has started transmitting */
-    elapsed = 0;
-    while (elapsed < busy_timeout_ms) {
+    /* 1) Probe for AUX → LOW — module has started transmitting.
+     * A short packet can finish before we ever sample LOW, so a missed
+     * transition is NOT an error: fall through and check for idle. */
+    start_us = esp_timer_get_time();
+    while ((esp_timer_get_time() - start_us) < (int64_t)busy_timeout_ms * 1000) {
         if (gpio_get_level(LORA_PIN_AUX) == 0) {
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
-        elapsed++;
+        lora_delay_ms(1);
     }
-    if (elapsed >= busy_timeout_ms) {
-        ESP_LOGW(TAG, "AUX did not go LOW (TX start timeout %d ms)", busy_timeout_ms);
-        /* Not necessarily fatal — the module may have finished already if the
-         * packet was very short.  Proceed to the idle wait. */
+
+    /* Already idle again → transmit finished (or was never busy). */
+    if (gpio_get_level(LORA_PIN_AUX) == 1) {
+        return 0;
     }
 
     /* 2) Wait for AUX → HIGH — module has finished transmitting */
-    elapsed = 0;
-    while (elapsed < idle_timeout_ms) {
+    start_us = esp_timer_get_time();
+    while ((esp_timer_get_time() - start_us) < (int64_t)idle_timeout_ms * 1000) {
         if (gpio_get_level(LORA_PIN_AUX) == 1) {
             return 0;              /* success */
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
-        elapsed++;
+        lora_delay_ms(1);
     }
 
     ESP_LOGW(TAG, "AUX TX completion timeout after %d ms", idle_timeout_ms);
@@ -143,13 +182,18 @@ int lora_send(const uint8_t *data, size_t len)
         return -1;
     }
 
-    /* Ensure in normal mode */
+    /* Ensure in normal mode (no-op when already there) */
     lora_set_mode(LORA_MODE_NORMAL);
 
-    /* Wait for AUX ready before sending */
+    /* Wait for AUX ready before sending. AUX may still be LOW because the
+     * PREVIOUS frame is on air — that is exactly what this wait is for, so
+     * give it the full timeout and only then one short retry. */
     if (lora_wait_aux(LORA_AUX_TIMEOUT_MS) != 0) {
-        ESP_LOGE(TAG, "AUX not ready before send");
-        return -1;
+        lora_delay_ms(50);
+        if (lora_wait_aux(LORA_AUX_TIMEOUT_MS) != 0) {
+            ESP_LOGE(TAG, "AUX not ready before send");
+            return -1;
+        }
     }
 
     /* Write data to UART */
@@ -160,7 +204,7 @@ int lora_send(const uint8_t *data, size_t len)
     }
 
     /* Wait for transmission to complete (AUX goes LOW then HIGH) */
-    if (lora_wait_tx_complete(LORA_AUX_TIMEOUT_MS, LORA_AUX_TIMEOUT_MS) != 0) {
+    if (lora_wait_tx_complete(LORA_AUX_BUSY_PROBE_MS, LORA_AUX_TIMEOUT_MS) != 0) {
         ESP_LOGW(TAG, "LoRa TX completion uncertain");
     }
 
@@ -289,6 +333,7 @@ void lora_sleep(void)
     /* Enter deep sleep mode: MD0=1, MD1=1 */
     gpio_set_level(LORA_PIN_MD0, 1);
     gpio_set_level(LORA_PIN_MD1, 1);
+    s_lora_mode = LORA_MODE_CONFIG;   /* same MD0/MD1 pattern as config/sleep */
     vTaskDelay(pdMS_TO_TICKS(LORA_MODE_SWITCH_MS));
     ESP_LOGI(TAG, "LoRa module in sleep mode");
 }
@@ -298,6 +343,7 @@ void lora_wake(void)
     /* Wake: MD0=0, MD1=0 (normal mode) */
     gpio_set_level(LORA_PIN_MD0, 0);
     gpio_set_level(LORA_PIN_MD1, 0);
+    s_lora_mode = LORA_MODE_NORMAL;
     vTaskDelay(pdMS_TO_TICKS(LORA_MODE_SWITCH_MS));
 
     if (lora_wait_aux(LORA_AUX_TIMEOUT_MS) != 0) {

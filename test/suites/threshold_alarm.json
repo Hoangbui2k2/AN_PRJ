@@ -4,7 +4,7 @@
   "timeout_seconds": 120,
   "steps": [
     {
-      "name": "Chờ data vượt ngưỡng (threshold_exceeded=true)",
+      "name": "TC-C02: chờ data vượt ngưỡng (threshold_exceeded=true)",
       "action": "expect",
       "timeout": 90,
       "expect_msg": {
@@ -14,7 +14,7 @@
       }
     },
     {
-      "name": "Chờ alarm 'Sensor alarm triggered'",
+      "name": "TC-C02/TC-F02: chờ alarm 'Sensor alarm triggered'",
       "action": "expect",
       "timeout": 60,
       "expect_msg": {

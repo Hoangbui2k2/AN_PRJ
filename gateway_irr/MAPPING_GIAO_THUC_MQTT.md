@@ -255,6 +255,71 @@ Mỗi lần gửi retry tối đa 5 lần, drop nếu quá hạn.
 
 ---
 
+## 7. Baseline (node ↔ gateway ↔ server) — gateway là bộ đệm/relay
+
+**Topic:** `irrigation/<site>/<gw>/node_<n>/baseline` (gateway ↔ server)
+**Topic lệnh:** `irrigation/<site>/<gw>/node_<n>/cmd` với `{"cmd":"set_baseline", ...}`
+
+Gateway **KHÔNG phải nguồn của baseline** — nó chỉ là bộ đệm LoRa. Bảng baseline do
+server cung cấp; gateway giữ tạm trong RAM đúng cho node đang được cấp, gửi xong thì xoá.
+
+```mermaid
+sequenceDiagram
+    participant N as Node (LoRa)
+    participant G as Gateway (đệm/relay)
+    participant S as Server
+    N->>G: REQ 0x09 (flags=BASELINE, mask=0x07)
+    G->>S: node_n/baseline {"status":"request","series_mask":7,"needed":1}
+    S->>G: node_n/cmd {"cmd":"set_baseline",...}
+    G->>N: chunk 0x07 (series 0,1,2 …) theo lượt
+    N->>G: 0x08 BASELINE_DONE (1 frame, bitmask các serie đã lưu)
+    G->>S: node_n/baseline {"status":"done","series_mask":7,"version":v}
+    Note over G: d? serie = have_mask → XOÁ b?ng của node (báo 'done' MỘT L?N)
+    N->>G: 0x09 REQ (flags=TIME) — chốt lại t sau khi cấp baseline
+```
+
+**Quy tắc (đúng như thiết kế hệ thống):**
+
+1. Node thiếu baseline → gửi `0x09 REQ`. Gateway **chuyển ngay** request đó cho server
+   dưới dạng `{"status":"request","series_mask":m}` và **giữ lượt** cho node đó.
+2. `"needed": 1` được thêm vào khi gateway **đang không giữ bảng nào** cho node — server
+   phải push lại `set_baseline`. Gateway không tự tạo được bảng.
+3. **Tuần tự 1 node / 1 thời điểm:** nếu node khác cũng REQ trong lúc node hiện tại đang
+   được cấp, gateway **xếp request vào hàng đợi (FIFO)** và **CHƯA báo server**; chỉ khi
+   node đang phục vụ báo `0x08 done` đủ series (lượt được trả tự do, log
+   `Relaying queued baseline request of node 0xXX …`) thì request kế tiếp mới được gửi
+   cho server để server push bảng cho node đó.
+4. Khi node đã lưu **đủ** các series mà gateway đang giữ (`have_mask`), gateway **xoá bảng
+   của node** (log `baseline session COMPLETE - table dropped`) và gửi server **ĐÚNG MỘT
+   message `done`** cho node đó: `{"node":N,"status":"done","version":v,"series_mask":m}`
+   (trước đây là 3 message, mỗi serie một message).
+5. Node báo xong bằng **1 frame `0x08` mang bitmask** (`field` 3..7 = bitmask, 0/1/2 = một
+   serie khi chỉ có 1) — gửi 3 frame rời nhau từng bị mất frame thứ 2 (echo + ACK xen giữa).
+6. Sau khi cấp xong baseline, node **LUÔN gửi thêm 1 REQ time** (`flags=TIME`) để chốt lại
+   `t` theo gateway trước khi bắt đầu so sánh nội suy (log `Boot sync: baseline xong …
+   gửi REQ TIME cuối để chốt t`).
+7. Node không uplink nữa → lượt tự trả sau `BASELINE_TURN_TIMEOUT_MS` = 120 s, riêng trường
+   hợp **đã gửi hết chunk mà thiếu frame DONE** thì trả sau `BASELINE_DONE_WAIT_MS` = 15 s.
+8. `set_baseline` schema mới: `{"cmd":"set_baseline","version":v,"series":[[[t,y]…],[[t,y]…],[[t,y]…]]}`
+   — series nào không đổi thì để `null`/`[]` (gateway bỏ qua series đó).
+
+**Trục thời gian `t` (0..95) = GIỜ TRONG NGÀY, không reset theo lần cấp baseline:**
+
+- Gateway lấy giờ thực bằng **SNTP** (`pool.ntp.org`) và tính `t = phút trong ngày / 15`
+  → cấp baseline lúc 14:00 thì `t ≈ 56`; gateway reboot cũng KHÔNG làm `t` về 0
+  (trước đây `t` đếm từ lúc gateway khởi động → sai thời điểm trong ngày).
+  Khi chưa có giờ thực, gateway tạm đếm từ lúc khởi động và ghi log cảnh báo.
+- Server có thể chỉnh giờ địa phương: `{"cmd":"sync_slot","slot":N}` = "hiện tại là slot N
+  trong ngày" → gateway lưu offset so với UTC (khác với chế độ cũ `slot_ms` = reset base về 0).
+- Node nhận `t` từ mọi downlink và tự cộng thời gian trôi qua (RTC) → `t` vẫn đúng giờ trong
+  ngày sau nhiều lần deep-sleep; **không reset `t` khi lưu baseline**.
+- Node so sánh dữ liệu đo với baseline nội suy **tại đúng `slot` hiện tại**
+  (`baseline_should_send(data, config_get_slot(), …)`), log `Baseline dev: series=… slot=…`.
+- Log để kiểm chứng: gateway `Đã có giờ thực (SNTP): t hiện tại = N (giờ trong ngày)`;
+  node `Baseline stored (mask=0xNN) at slot t=N`.
+
+---
+
 ## Tổng kết
 
 | # | Topic | Hướng | Định dạng |
@@ -263,5 +328,6 @@ Mỗi lần gửi retry tối đa 5 lần, drop nếu quá hạn.
 | 2 | `.../node_<n>/status` | Node → Server | online/offline |
 | 3 | `.../node_<n>/alarm` | Node → Server | cảnh báo |
 | 4 | `.../<gw>/status` | Gateway → Server | heartbeat |
-| 5 | `.../node_<n>/cmd` | Server → Node | lệnh |
-| 6 | `.../<gw>/config` | Server → Gateway | *(TODO)* |
+| 5 | `.../node_<n>/cmd` | Server → Node | lệnh (gồm `set_baseline`) |
+| 6 | `.../node_<n>/baseline` | Gateway → Server | `request`/`done` (+ `needed`) |
+| 7 | `.../<gw>/config` | Server → Gateway | *(TODO)* |

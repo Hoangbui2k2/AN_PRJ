@@ -34,9 +34,11 @@
 #include "mqtt.h"
 #include "node_manager.h"
 #include "command_cache.h"
+#include "baseline_manager.h"
 #include "config.h"
 #include "topic.h"
 #include "crc.h"
+#include "slot.h"
 #include "certs.h"
 
 /* ---------------------------- Constants ----------------------------------- */
@@ -50,10 +52,13 @@
 #define LORA_RX_STACK_SIZE       4096
 #define LORA_RX_PRIORITY         5
 /* The worker task runs the full uplink chain (cJSON create/print + MQTT
- * publish + LoRa downlink ACK). 4 KiB was too small and overflowed on the
- * first uplink (status + data + alarm publishes back-to-back) → IllegalInstruction.
- * Give it a roomy stack; it is the busiest task in the gateway. */
-#define LORA_WORKER_STACK_SIZE   8192
+ * publish + LoRa downlink ACK). It is the busiest task in the gateway: the
+ * publish helpers each hold a 128-byte topic buffer on the stack, and
+ * esp_mqtt_client_publish does non-trivial work on the caller's stack. 4 KiB
+ * overflowed (IllegalInstruction) and even 8 KiB still crashed inside
+ * uart_wait_tx_done at the deepest point of the chain. Give it a generous
+ * stack and log the high-water mark so we can right-size it. */
+#define LORA_WORKER_STACK_SIZE   12288
 #define GATEWAY_STATUS_STACK_SIZE 6144
 #define NODE_MONITOR_STACK_SIZE  3072
 #define NODE_MONITOR_PRIORITY    4
@@ -323,6 +328,47 @@ static void publish_node_status(uint8_t node_id, bool online)
 /* ---------------------------- LoRa Packet Processing ---------------------- */
 
 /**
+ * @brief Publish a baseline event to the server.
+ *
+ * status = "request" (node asked for its baseline) or "done" (node stored a
+ * series). A single topic carries both so the server can drive the
+ * request -> push -> done handshake one node at a time.
+ *
+ * needed != 0 only on "request": the node asked for a table the gateway does
+ * NOT have (never received, or lost because the sessions live in RAM only).
+ * The server/cloud must re-push the table; the gateway cannot invent it.
+ */
+static void publish_node_baseline(uint8_t node_id, const char *status,
+                                  uint8_t series, uint8_t version,
+                                  uint8_t mask, uint8_t needed)
+{
+    if (!mqtt_is_connected()) return;
+
+    char topic[TOPIC_MAX_LEN];
+    topic_build(topic, sizeof(topic), s_config.site, s_config.gateway_id,
+                TOPIC_NODE_BASELINE, node_id);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return;
+
+    cJSON_AddNumberToObject(root, "node", node_id);
+    cJSON_AddStringToObject(root, "status", status);
+    if (series != 0xFF) cJSON_AddNumberToObject(root, "series", series);
+    if (version != 0)   cJSON_AddNumberToObject(root, "version", version);
+    if (mask != 0)      cJSON_AddNumberToObject(root, "series_mask", mask);
+    if (needed)         cJSON_AddNumberToObject(root, "needed", 1);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    if (json_str) {
+        mqtt_publish(topic, json_str, 1);
+        ESP_LOGI(TAG, "Published baseline '%s' for node 0x%02X: %s",
+                 status, node_id, json_str);
+        free(json_str);
+    }
+    cJSON_Delete(root);
+}
+
+/**
  * @brief Send all pending cached commands for a node
  *
  * Called when a node becomes reachable (data / heartbeat / alarm packet).
@@ -337,7 +383,7 @@ static void send_cached_commands_for_node(uint8_t node_id)
                  node_id, cached->retry_count, MAX_RETRY);
 
         if (lora_send_command(cached->cmd[0], cached->cmd[2],
-                              cached->cmd[3], cached->cmd[4])) {
+                              cached->cmd[3], cached->cmd[4], slot_current())) {
             command_cache_mark_sent(cached);
         } else {
             ESP_LOGW(TAG, "Failed to send cached command to node 0x%02X", node_id);
@@ -356,12 +402,48 @@ static void send_cached_commands_for_node(uint8_t node_id)
  */
 static void ack_or_flush_node(uint8_t node_id)
 {
-    ESP_LOGI(TAG, "ack_or_flush_node: node 0x%02X, cached=%d",
-             node_id, command_cache_count_for_node(node_id));
+    ESP_LOGI(TAG, "ack_or_flush_node: node 0x%02X, cached=%d, baseline_pending=%d",
+             node_id, command_cache_count_for_node(node_id),
+             baseline_pending(node_id));
+
+    /* Lượt có bị treo không? (mất frame DONE ⇒ trả lượt sớm cho node kế tiếp) */
+    baseline_turn_watchdog();
+
+    /* Gateway = bộ đệm/relay LoRa: nếu lượt đang TRỐNG và còn request của node
+     * khác đang chờ (node trước đã 'done'), chuyển request đó cho server ngay
+     * bây giờ để server push bảng cho node kế tiếp — mỗi lúc chỉ 1 node. */
+    {
+        uint8_t rnode = 0, rmask = 0;
+        if (baseline_take_pending_req(&rnode, &rmask)) {
+            if (baseline_req_publish_allowed(rnode)) {
+                publish_node_baseline(rnode, "request", 0xFF, 0, rmask,
+                                      baseline_pending(rnode) ? 0 : 1);
+            }
+        }
+    }
+    /* A pending baseline transfer takes priority: it is time-bounded (the node
+     * flushes it in the same post-uplink listen window). Chunks themselves act
+     * as the downlink response, so no separate ACK is needed.
+     *
+     * Delivery is SEQUENTIAL — only the node holding the baseline turn gets
+     * chunks. Every other node still gets its response below (cached command or
+     * empty ACK) so it stays time-synced and simply waits for its turn. */
+    if (baseline_pending(node_id) && baseline_may_flush(node_id)) {
+        int sent = baseline_flush_for_node(node_id, BASELINE_CHUNKS_PER_FLUSH);
+        if (sent > 0) {
+            ESP_LOGI(TAG, "Sent %d baseline chunk(s) to node 0x%02X",
+                     sent, node_id);
+            return;
+        }
+    } else if (baseline_pending(node_id)) {
+        ESP_LOGI(TAG, "Baseline turn held by node 0x%02X - node 0x%02X waits its turn",
+                 baseline_active_node(), node_id);
+    }
+
     if (command_cache_count_for_node(node_id) > 0) {
         send_cached_commands_for_node(node_id);
     } else {
-        if (lora_send_ack(node_id)) {
+        if (lora_send_ack(node_id, slot_current())) {
             ESP_LOGI(TAG, "Sent empty ACK to node 0x%02X (no command queued)", node_id);
         }
     }
@@ -388,6 +470,98 @@ static void process_node_packet(const lora_uplink_packet_t *pkt)
             ESP_LOGW(TAG, "Unexpected ACK from node 0x%02X — no command in flight",
                      pkt->node_id);
         }
+        return;
+    }
+
+    /* Handle baseline-done uplink (type 0x08)
+     * Layout: node|0x08|series|version|0|0|0|crc  (byte2=series, byte3=version) */
+    if (pkt->type == PKT_TYPE_BASELINE_DONE) {
+        /* Trường series: 0/1/2 = một serie; 3..7 = bitmask nhiều serie cùng
+         * version (node gộp 1 frame để tránh mất frame giữa chuỗi). Dù nhận
+         * kiểu nào, gateway vẫn publish 'done' cho TỪNG serie như spec. */
+        uint8_t field   = pkt->flags;
+        uint8_t version = pkt->soil;
+        uint8_t mask    = (field > 2u) ? (uint8_t)(field & 0x07u)
+                                       : (uint8_t)(1u << field);
+        ESP_LOGI(TAG, "BASELINE_DONE node 0x%02X series/mask=0x%02X -> mask=0x%02X v%u",
+                 pkt->node_id, field, mask, version);
+
+        node_mark_online(pkt->node_id);
+
+        /* Chụp trạng thái TRƯỚC khi đánh dấu: session được xoá ngay khi đủ serie,
+         * nên phải lấy mask trước đó để báo 'done' cho server. */
+        uint8_t done_before = baseline_done_mask(pkt->node_id);
+        uint8_t have_before = baseline_have_mask(pkt->node_id);
+
+        bool complete = false;
+        for (uint8_t s = 0; s < 3; s++) {
+            if (!(mask & (uint8_t)(1u << s))) continue;
+            /* Session đã xong (hoặc gateway không giữ serie này) → dừng. */
+            if (!baseline_pending(pkt->node_id)) break;
+            if (baseline_mark_done(pkt->node_id, s, version)) complete = true;
+        }
+
+        /* CHỈ báo 'done' MỘT LẦN cho node, khi node đã xác nhận XONG HẾT các serie
+         * mà gateway đang giữ (trước đây báo 3 lần, mỗi serie 1 lần). */
+        if (complete) {
+            uint8_t all = (uint8_t)((done_before | mask) &
+                                    (have_before ? have_before : 0x07u));
+            ESP_LOGI(TAG, "Node 0x%02X baseline session fully delivered "
+                     "(mask=0x%02X) - reporting ONE 'done'", pkt->node_id, all);
+            publish_node_baseline(pkt->node_id, "done", 0xFF, version, all, 0);
+        } else {
+            ESP_LOGI(TAG, "Node 0x%02X partially confirmed (mask=0x%02X of 0x%02X)"
+                     " - waiting for the rest", pkt->node_id,
+                     (uint8_t)(done_before | mask), have_before);
+        }
+
+        /* Reply so the node sees a valid downlink and resets gatewayLostCount. */
+        ack_or_flush_node(pkt->node_id);
+        return;
+    }
+
+    /* Handle baseline/time request uplink (type 0x09)
+     * Layout: node|0x09|flags|series_mask|0|0|0|crc */
+    if (pkt->type == PKT_TYPE_REQ) {
+        uint8_t flags = pkt->flags;
+        uint8_t mask  = pkt->soil;
+        ESP_LOGI(TAG, "REQ node 0x%02X flags=0x%02X mask=0x%02X",
+                 pkt->node_id, flags, mask);
+
+        node_mark_online(pkt->node_id);
+
+        if (flags & REQ_FLAG_BASELINE) {
+            bool have_table = baseline_pending(pkt->node_id);
+            baseline_rearm(pkt->node_id);
+            if (baseline_req_should_relay(pkt->node_id)) {
+                /* Đến lượt node này: giữ lượt rồi báo server push bảng.
+                 * needed=1 khi gateway đang KHÔNG giữ bảng nào cho node (server
+                 * phải gửi lại) — gateway chỉ là bộ đệm, không tự tạo bảng.
+                 * Chỉ publish lại sau BASELINE_REQ_PUBLISH_MIN_MS để node REQ
+                 * liên tục không dội MQTT lên server. */
+                baseline_claim_turn(pkt->node_id);
+                baseline_req_dequeue(pkt->node_id);
+                if (baseline_req_publish_allowed(pkt->node_id)) {
+                    publish_node_baseline(pkt->node_id, "request", 0xFF, 0, mask,
+                                          have_table ? 0 : 1);
+                } else {
+                    ESP_LOGD(TAG, "Request of node 0x%02X already relayed - not repeating",
+                             pkt->node_id);
+                }
+            } else {
+                /* Node khác đang được cấp: xếp request vào hàng đợi, CHƯA báo
+                 * server. Khi node đang phục vụ xong, gateway sẽ tự chuyển
+                 * request này cho server (xem ack_or_flush_node). */
+                ESP_LOGI(TAG, "Node 0x%02X asks for baseline while node 0x%02X is "
+                         "being served - request queued (server notified when the "
+                         "turn is free)", pkt->node_id, baseline_active_node());
+                baseline_req_enqueue(pkt->node_id, mask);
+            }
+        }
+
+        /* Always answer: chunks if a baseline is queued, otherwise an empty ACK
+         * carrying the current slot (which is all a REQ_TIME needs). */
+        ack_or_flush_node(pkt->node_id);
         return;
     }
 
@@ -610,15 +784,63 @@ static void get_node_defaults(uint8_t node_id, node_config_t *out)
     *out = s_config.nodes[0];
 }
 
+/**
+ * @brief Parse a baseline point list [[t,y],[t,y],...] into flat arrays.
+ *
+ * @param pts  JSON array of [t,y] pairs
+ * @param t    Output slot indices
+ * @param y    Output values
+ * @param max  Capacity of the output arrays
+ * @return Number of valid points, or -1 if the list is malformed
+ *         (empty/too long, t not strictly ascending, t outside 0..95,
+ *          y outside 0..255)
+ */
+static int parse_baseline_points(cJSON *pts, uint8_t *t, uint8_t *y, int max)
+{
+    int cnt = cJSON_GetArraySize(pts);
+    if (cnt <= 0 || cnt > max) {
+        ESP_LOGW(TAG, "set_baseline: bad count %d (max %d)", cnt, max);
+        return -1;
+    }
+
+    int n      = 0;
+    int last_t = -1;
+
+    for (int i = 0; i < cnt; i++) {
+        cJSON *pair = cJSON_GetArrayItem(pts, i);
+        if (!cJSON_IsArray(pair) || cJSON_GetArraySize(pair) < 2) {
+            return -1;
+        }
+        cJSON *ti = cJSON_GetArrayItem(pair, 0);
+        cJSON *yi = cJSON_GetArrayItem(pair, 1);
+        if (!cJSON_IsNumber(ti) || !cJSON_IsNumber(yi)) {
+            return -1;
+        }
+        int tv = ti->valueint;
+        int yv = yi->valueint;
+        if (tv < 0 || tv > SLOT_MAX || tv <= last_t || yv < 0 || yv > 255) {
+            ESP_LOGW(TAG, "set_baseline: bad point %d (t=%d y=%d)", i, tv, yv);
+            return -1;
+        }
+        t[n]   = (uint8_t)tv;
+        y[n]   = (uint8_t)yv;
+        last_t = tv;
+        n++;
+    }
+    return n;
+}
+
 static void handle_mqtt_command(uint8_t node_id, const char *payload, size_t len)
 {
-    (void)len;
-
-    ESP_LOGI(TAG, "Processing MQTT command for node 0x%02X: %s", node_id, payload);
+    /* Log do dai payload: set_baseline day du (3x96 diem ~ 2.9 KB) la truong hop
+     * lon nhat; log kem do dai de phat hien ngay viec bi cat cut. */
+    ESP_LOGI(TAG, "Processing MQTT command for node 0x%02X (%u bytes): %.120s",
+             node_id, (unsigned)len, payload);
 
     cJSON *root = cJSON_Parse(payload);
     if (!root) {
-        ESP_LOGW(TAG, "Failed to parse JSON command: %s", payload);
+        ESP_LOGW(TAG, "Failed to parse JSON command (%u bytes): %.120s",
+                 (unsigned)len, payload);
         return;
     }
 
@@ -630,6 +852,110 @@ static void handle_mqtt_command(uint8_t node_id, const char *payload, size_t len
     }
 
     const char *cmd_str = cmd_item->valuestring;
+
+    /* ── Gateway-level command: reset the 15-minute slot base (t = 0) ──
+     * The server sends this at 00:00 (typically addressed to node 0xFF). No
+     * downlink is needed here: every subsequent downlink already carries the
+     * new slot, and the boundary broadcast covers nodes parked at midnight. */
+    if (strcmp(cmd_str, "sync_slot") == 0) {
+        cJSON *ms = cJSON_GetObjectItem(root, "slot_ms");
+        cJSON *sl = cJSON_GetObjectItem(root, "slot");
+        uint32_t slot_ms = (ms && cJSON_IsNumber(ms)) ? (uint32_t)ms->valueint : 0;
+        if (sl && cJSON_IsNumber(sl)) {
+            /* "hiện tại là slot N trong ngày": giữ t bám giờ thực (baseline có
+             * thể được cấp ở bất kỳ thời điểm nào trong ngày). */
+            slot_set_time_of_day((uint8_t)sl->valueint);
+            ESP_LOGI(TAG, "Server sync_slot: t trong ngày = %d (node 0x%02X)",
+                     sl->valueint, node_id);
+        } else {
+            slot_sync_reset(slot_ms);
+            ESP_LOGI(TAG, "Server sync_slot: base reset to 0 (node 0x%02X, slot_ms=%lu)",
+                     node_id, (unsigned long)(slot_ms ? slot_ms : SLOT_MS));
+        }
+        cJSON_Delete(root);
+        return;
+    }
+
+    /* ── Gateway-level command: store a baseline table for a node ──
+     *
+     * NEW SCHEMA — the server sends the whole table in ONE message and the
+     * gateway splits it into its 3 series (each series is then dribbled to the
+     * node as 0x07 chunks, 3 per wake cycle):
+     *   {"cmd":"set_baseline","version":3,
+     *    "series":[[[t,y],...],    // index 0 = temp
+     *              [[t,y],...],    // index 1 = humidity
+     *              [[t,y],...]]}   // index 2 = soil
+     * A series entry that is missing/null/[] leaves that series unchanged.
+     *
+     * LEGACY SCHEMA — still accepted, one message per series:
+     *   {"cmd":"set_baseline","series":0,"version":3,"points":[[t,y],...]}
+     *
+     * A stored series is pushed on the next uplink WITHOUT the node asking
+     * (server push), and a new version replaces the whole node session. */
+    if (strcmp(cmd_str, "set_baseline") == 0) {
+        cJSON *ser = cJSON_GetObjectItem(root, "series");
+        cJSON *ver = cJSON_GetObjectItem(root, "version");
+        uint8_t version = (cJSON_IsNumber(ver) && ver->valueint > 0)
+                              ? (uint8_t)ver->valueint : 1;
+
+        /* ── New schema: series = array of up to 3 point-lists ── */
+        if (cJSON_IsArray(ser)) {
+            uint8_t t[BASELINE_MAX_POINTS];
+            uint8_t y[BASELINE_MAX_POINTS];
+            int n_lists = cJSON_GetArraySize(ser);
+            int stored  = 0;
+
+            for (int s = 0; s < n_lists && s < BASELINE_SERIES_COUNT; s++) {
+                cJSON *pts = cJSON_GetArrayItem(ser, s);
+                if (!cJSON_IsArray(pts) || cJSON_GetArraySize(pts) == 0) {
+                    ESP_LOGI(TAG, "set_baseline: series %d not updated", s);
+                    continue;
+                }
+                int n = parse_baseline_points(pts, t, y, BASELINE_MAX_POINTS);
+                if (n <= 0) {
+                    ESP_LOGW(TAG, "set_baseline: series %d rejected", s);
+                    continue;
+                }
+                if (baseline_store(node_id, (uint8_t)s, version, t, y, (uint8_t)n)) {
+                    ESP_LOGI(TAG, "Baseline accepted: node 0x%02X series=%d v%u (%d points)",
+                             node_id, s, version, n);
+                    stored++;
+                }
+            }
+
+            ESP_LOGI(TAG, "set_baseline table: node 0x%02X v%u -> %d series stored",
+                     node_id, version, stored);
+            cJSON_Delete(root);
+            return;
+        }
+
+        /* ── Legacy schema: series = id, points = list ── */
+        cJSON *pts = cJSON_GetObjectItem(root, "points");
+        if (!cJSON_IsNumber(ser) || !cJSON_IsArray(pts)) {
+            ESP_LOGW(TAG, "set_baseline: missing/invalid 'series'");
+            cJSON_Delete(root);
+            return;
+        }
+
+        uint8_t series = (uint8_t)ser->valueint;
+        if (series >= BASELINE_SERIES_COUNT) {
+            ESP_LOGW(TAG, "set_baseline: bad series %u", series);
+            cJSON_Delete(root);
+            return;
+        }
+
+        uint8_t t[BASELINE_MAX_POINTS];
+        uint8_t y[BASELINE_MAX_POINTS];
+        int n = parse_baseline_points(pts, t, y, BASELINE_MAX_POINTS);
+        if (n > 0 && baseline_store(node_id, series, version, t, y, (uint8_t)n)) {
+            ESP_LOGI(TAG, "Baseline accepted for node 0x%02X series=%u v%u (%d points)",
+                     node_id, series, version, n);
+        }
+
+        cJSON_Delete(root);
+        return;
+    }
+
     uint8_t lora_cmd_byte = map_command_to_lora_byte(cmd_str);
 
     if (lora_cmd_byte == 0) {
@@ -867,12 +1193,55 @@ static void lora_worker_task(void *pvParameters)
         }
 
         process_node_packet(&packet);
+
+        /* Report the stack high-water mark so we can right-size the worker
+         * task stack (this is the task that overflowed). */
+        ESP_LOGI(TAG, "Worker stack free: %lu bytes (high-water)",
+                 (unsigned long)uxTaskGetStackHighWaterMark(NULL));
     }
 }
 
 /**
+ * @brief Broadcast the t=0 boundary sync when the day rolls over.
+ *
+ * Nodes park awake shortly before midnight and listen for this frame. We do
+ * not know exactly when each node wakes, so the broadcast is repeated for
+ * ~5 minutes (every ~45 s) to cover the listen window.
+ */
+static void slot_boundary_check(void)
+{
+    const uint64_t BROADCAST_TOTAL_MS = 5 * 60 * 1000ULL;
+    const uint64_t BROADCAST_GAP_MS   = 45 * 1000ULL;
+
+    static bool     active  = false;
+    static uint64_t next_ms = 0;
+    static uint64_t end_ms  = 0;
+
+    uint64_t now_ms = esp_timer_get_time() / 1000ULL;
+
+    if (!active && slot_wrapped()) {
+        slot_clear_wrap();
+        active  = true;
+        end_ms  = now_ms + BROADCAST_TOTAL_MS;
+        next_ms = 0;
+        ESP_LOGW(TAG, "Slot boundary 95->0: broadcasting t=0 for ~5 min");
+    }
+
+    if (!active) return;
+    if (now_ms >= end_ms) {
+        active = false;
+        return;
+    }
+    if (now_ms < next_ms) return;
+
+    /* dest=0xFF (broadcast), cmd=0x09 keep-alive, slot=0 */
+    lora_send_command(0xFF, LORA_CMD_ACK, 0, 0, 0);
+    next_ms = now_ms + BROADCAST_GAP_MS;
+}
+
+/**
  * @brief Command Retry Task
- * 
+ *
  * Periodically checks the command cache for commands that need retry.
  * Sends them if the node is now online.
  */
@@ -890,6 +1259,11 @@ static void cmd_retry_task(void *pvParameters)
          * here, because the node may be in deep sleep; a blind retry would only
          * burn LoRa airtime and risk colliding with the node's listen window. */
         command_cache_process_timeouts();
+
+        /* Keep the slot estimate fresh (drives wrap detection) and broadcast
+         * the t=0 sync around the day boundary. */
+        (void)slot_current();
+        slot_boundary_check();
 
         vTaskDelay(pdMS_TO_TICKS(CMD_RETRY_PERIOD_MS));
     }
@@ -993,6 +1367,13 @@ void app_main(void)
     /* Initialize node manager and command cache */
     node_manager_init();
     command_cache_init();
+
+    /* Initialize the per-node baseline session table */
+    baseline_manager_init();
+
+    /* Initialize the 15-minute slot manager (t = 0 at boot until the server
+     * issues a sync_slot command). */
+    slot_init();
 
     /* Register the 2 default nodes from config */
     for (int i = 0; i < DEFAULT_NODE_COUNT; i++) {

@@ -25,15 +25,19 @@ void config_set_defaults(gateway_config_t *config)
     strlcpy(config->gateway_id, "gw_01", sizeof(config->gateway_id));
     // strlcpy(config->wifi_ssid, "Hoa Hau", sizeof(config->wifi_ssid));
     // strlcpy(config->wifi_password, "12233445", sizeof(config->wifi_password));
-        strlcpy(config->wifi_ssid, "Hoa Hau", sizeof(config->wifi_ssid));
+    strlcpy(config->wifi_ssid, "Hoa Hau", sizeof(config->wifi_ssid));
     strlcpy(config->wifi_password, "12233445", sizeof(config->wifi_password));
-    strlcpy(config->mqtt_broker_uri, "mqtts://a1xel4n1u7sh7s-ats.iot.ap-southeast-1.amazonaws.com", sizeof(config->mqtt_broker_uri));
+    // strlcpy(config->mqtt_broker_uri, "mqtts://a1xel4n1u7sh7s-ats.iot.ap-southeast-1.amazonaws.com", sizeof(config->mqtt_broker_uri));
+    strlcpy(config->mqtt_broker_uri, "mqtts://d246c46a2ebe40d2ae0c787f92bfdbab.s1.eu.hivemq.cloud", sizeof(config->mqtt_broker_uri));
     config->mqtt_port = 8883;
     strlcpy(config->mqtt_username, "hivemq.webclient.1742180699133", sizeof(config->mqtt_username));
     strlcpy(config->mqtt_password, "#x1V7:H62pCZ%e&nGkgR", sizeof(config->mqtt_password));
-    config->mqtt_broker_type = MQTT_BROKER_AWS;
+    // config->mqtt_broker_type = MQTT_BROKER_AWS;
+    config->mqtt_broker_type = MQTT_BROKER_HIVEMQ;
     strlcpy(config->mqtt_client_id, "gw-01", sizeof(config->mqtt_client_id));
 
+    
+config->mqtt_broker_type = MQTT_BROKER_HIVEMQ;
     /* ── Default nodes (2) ──
      * These are registered at startup and their values are used as
      * defaults whenever the server sends a command without parameters. */

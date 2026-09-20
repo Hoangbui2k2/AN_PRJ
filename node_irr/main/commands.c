@@ -5,9 +5,11 @@
 #include "pump.h"
 #include "power.h"
 #include "irrigation.h"
+#include "baseline.h"
 #include "crc.h"
 #include "esp_log.h"
 #include "esp_attr.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdbool.h>
@@ -19,6 +21,30 @@ static const char *TAG = "COMMANDS";
 #define UPLINK_RETRIES        3   /* Max uplink transmit attempts */
 #define ACK_SEND_RETRIES      3   /* ACK transmit retries (target < 500 ms) */
 #define PENDING_WINDOW_MS     250 /* Listen window when no uplink was just sent */
+
+/* Downlink burst draining.
+ *
+ * A baseline update arrives as SEVERAL 0x07 chunks back-to-back (the gateway
+ * sends BASELINE_CHUNKS_PER_FLUSH chunks per opportunity), so a downlink window
+ * must consume the whole burst. Each lora_receive_frame() call reads at most one
+ * frame, therefore the window is drained frame-by-frame until the line goes
+ * idle — reading a single frame would lose the rest of the burst and the series
+ * could never complete. */
+#define DOWNLINK_IDLE_GAP_MS   150  /* idle time that closes the window (no burst) */
+#define DOWNLINK_BURST_GAP_MS  400  /* max gap between two baseline chunks */
+#define DOWNLINK_BURST_MAX_MS  3000 /* hard cap on one drain (awake-time guard) */
+
+/* Boot-sync baseline window.
+ *
+ * LoRa là BÁN SONG CÔNG: khi node phát (DONE 0x08) thì nó KHÔNG thu được, và
+ * gateway cũng không nghe được gì (đang phát burst). Vì vậy node phải CHỜ HẾT
+ * burst chunk của gateway (các chunk cách nhau ~300 ms) rồi mới commit + phát
+ * 0x08, nếu không: node mất chunk serie 1/2, gateway mất DONE → gateway re-arm
+ * và gửi lại từ serie 0 mãi mãi (chunk storm, WDT reset gateway). */
+#define BASELINE_BURST_IDLE_MS 800
+#define BASELINE_DONE_GAP_MS   400  /* giãn cách giữa các DONE: phải LỚN HƠN
+                                     * cửa sổ TX ACK của gateway (~265 ms) để
+                                     * gateway đọc được từng frame một. */
 
 /* Retry backoff between uplink attempts when no downlink was received. The
  * delay grows with each attempt (base << attempt) so the node does not spam
@@ -83,73 +109,180 @@ static void cmd_dedup_store(uint8_t cmd, uint8_t p1, uint8_t p2)
  * @param timeout_ms Max time to wait for the full frame
  * @return 1 = full frame received, 0 = timeout
  */
-static int lora_receive_frame(uint8_t *buf, int *out_len, int timeout_ms)
+/**
+ * @brief Return the total frame length implied by the frame header, or 0 if
+ *        more header bytes are still needed.
+ *
+ * Supported downlink frames:
+ *   - 0x05 command : fixed 7 bytes (dest|type|cmd|p1|p2|slot|crc)
+ *   - 0x07 baseline: 7 + 2*n_points + 1 (variable)
+ *   - anything else: legacy 8-byte frame (ACK etc.)
+ */
+static int lora_frame_need(const uint8_t *buf, int acc_len)
 {
-    int acc_len = 0;
-    int elapsed = 0;
+    if (acc_len < 2) return 0;
 
-    while (elapsed < timeout_ms) {
-        int n = lora_receive(&buf[acc_len], 8 - acc_len);
-        if (n > 0) {
-            acc_len += n;
-            ESP_LOGI(TAG, "RX: +%d bytes (frame total %d)", n, acc_len);
-        }
-        if (acc_len >= 2) {
-            int need = (buf[1] == PKT_TYPE_CMD) ? 6 : 8;
-            if (acc_len >= need) {
-                *out_len = need;
-                return 1;
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-        elapsed += 10;
+    uint8_t type = buf[1];
+    if (type == PKT_TYPE_CMD) {
+        return (int)sizeof(lora_cmd_packet_t);      /* 7 */
     }
-    return 0;
+    if (type == PKT_TYPE_BASELINE) {
+        if (acc_len < 7) return 0;                  /* need n_points first */
+        int n = buf[6];
+        if (n > BASELINE_POINTS_PER_CHUNK) n = BASELINE_POINTS_PER_CHUNK;
+        return 7 + 2 * n + 1;
+    }
+    return 8;                                       /* legacy / ACK */
 }
 
 /**
- * @brief Open the post-uplink downlink window and handle any command from the
- *        gateway (spec: gateway flushes its command cache immediately upon
- *        receiving data/heartbeat/alarm from the node).
- *
- *   - Valid command (node_id match, type 0x05, CRC8 ok) → execute + ACK 0x03,
- *     reset gatewayLostCount.
- *   - CRC mismatch or wrong node_id → NO ACK (spec A).
- *   - Legacy 8-byte ACK (type 0x03) from gateway → liveness, reset count.
- *
- * @param data Current sensor readings (used by REPORT, may be NULL)
- * @return 1 if a valid downlink was received (gateway alive), 0 otherwise
+ * @brief Receive one complete LoRa frame (command, baseline chunk or packet).
+ * @param buf        Output buffer (must be >= BASELINE_MAX_FRAME bytes)
+ * @param buf_size   Capacity of buf
+ * @param out_len    Received frame length
+ * @param timeout_ms Max time to wait for the full frame
+ * @return 1 = full frame received, 0 = timeout
  */
-static int commands_wait_downlink(const sensor_data_t *data)
+/* ──────────── RX staging (frame reassembly across UART reads) ────────────
+ *
+ * lora_receive() hands back whatever the UART happens to hold at that moment,
+ * and two baseline chunks (14 B each) very often arrive inside ONE read. The
+ * old code read straight into a single-frame buffer, so any frame behind the
+ * first one was silently DROPPED (and the buffer-size warning fired on every
+ * burst). Stage the raw bytes here and hand out exactly one frame per call;
+ * leftover bytes stay for the next call.
+ */
+#define RX_STAGE_SIZE   192
+#define RX_RESYNC_MS    300   /* no progress for this long → drop 1 byte */
+
+static uint8_t s_rx_stage[RX_STAGE_SIZE];
+static int     s_rx_len = 0;
+
+/**
+ * @brief Receive one complete LoRa frame (command, baseline chunk or packet).
+ * @param buf        Output buffer (must be >= BASELINE_MAX_FRAME bytes)
+ * @param buf_size   Capacity of buf
+ * @param out_len    Received frame length
+ * @param timeout_ms Max time to wait for the full frame
+ * @return 1 = full frame received, 0 = timeout
+ */
+static int lora_receive_frame(uint8_t *buf, int buf_size, int *out_len, int timeout_ms)
+{
+    int64_t start_us         = esp_timer_get_time();
+    int64_t last_progress_us = start_us;
+
+    while (1) {
+        /* 1) Hand out a complete frame already held in the stage. */
+        if (s_rx_len > 0) {
+            int need = lora_frame_need(s_rx_stage, s_rx_len);
+
+            if (need > 0 && s_rx_len >= need) {
+                if (need > buf_size) need = buf_size;   /* paranoia */
+                memcpy(buf, s_rx_stage, (size_t)need);
+                memmove(&s_rx_stage[0], &s_rx_stage[need],
+                        (size_t)(s_rx_len - need));
+                s_rx_len -= need;
+                *out_len = need;
+                return 1;
+            }
+
+            /* A frame longer than the stage can ever hold is unrecoverable. */
+            if (need > RX_STAGE_SIZE) {
+                ESP_LOGW(TAG, "Frame len %d > stage %d - dropping staged bytes",
+                         need, RX_STAGE_SIZE);
+                s_rx_len = 0;
+            }
+        }
+
+        if ((esp_timer_get_time() - start_us) / 1000 >= timeout_ms) {
+            return 0;
+        }
+
+        /* 2) Refill the stage from the UART. */
+        if (s_rx_len < RX_STAGE_SIZE) {
+            int n = lora_receive(&s_rx_stage[s_rx_len],
+                                 (size_t)(RX_STAGE_SIZE - s_rx_len));
+            if (n > 0) {
+                s_rx_len += n;
+                last_progress_us = esp_timer_get_time();
+                ESP_LOGI(TAG, "RX: +%d bytes (staged %d)", n, s_rx_len);
+                continue;               /* try to frame immediately */
+            }
+        }
+
+        /* 3) Resync: bytes that never complete a frame are noise (a truncated
+         *    tail, a corrupted chunk, ...). Drop the oldest byte so a good
+         *    frame behind them is not blocked forever. A stage holding MORE
+         *    than one maximum frame that still cannot be framed is definitely
+         *    garbage (valid frames always frame immediately), so flush it whole
+         *    instead of nibbling 1 byte every RX_RESYNC_MS. */
+        if (s_rx_len > 0 &&
+            (esp_timer_get_time() - last_progress_us) / 1000 >= RX_RESYNC_MS) {
+            if (s_rx_len > BASELINE_MAX_FRAME) {
+                ESP_LOGW(TAG, "RX resync: flushing %d garbage byte(s)", s_rx_len);
+                s_rx_len = 0;
+            } else {
+                ESP_LOGW(TAG, "RX resync: dropping 1 stale byte (staged %d)", s_rx_len);
+                memmove(&s_rx_stage[0], &s_rx_stage[1], (size_t)(s_rx_len - 1));
+                s_rx_len--;
+            }
+            last_progress_us = esp_timer_get_time();
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/**
+ * @brief Handle ONE downlink frame (already framed and length-validated).
+ *
+ * @return 1 = valid downlink (gateway alive), 0 = frame consumed but ignored,
+ *        -1 = consumed with a CRC / destination error (no ACK, spec A)
+ */
+static int process_downlink_frame(const uint8_t *buf, int len,
+                                  const sensor_data_t *data)
 {
     app_config_t *cfg = config_get();
-    uint8_t buf[8];
-    int len = 0;
 
-    ESP_LOGI(TAG, "Downlink window open (%d ms)", DOWNLINK_WINDOW_MS);
-
-    if (lora_receive_frame(buf, &len, DOWNLINK_WINDOW_MS) != 1) {
-        ESP_LOGI(TAG, "Downlink window closed - no downlink received");
+    /* LoRa is a shared channel: every node hears every frame. Anything not
+     * addressed to us (or broadcast) must be ignored WITHOUT touching state —
+     * most importantly a 0x07 chunk addressed to another node must never be
+     * stored as ours. */
+    if (buf[0] != 0xFF && buf[0] != cfg->nodeId) {
+        ESP_LOGD(TAG, "Frame for node 0x%02X - ignoring (we are 0x%02X)",
+                 buf[0], cfg->nodeId);
         return 0;
     }
 
-    if (buf[1] == PKT_TYPE_CMD && len >= 6) {
+    if (buf[1] == PKT_TYPE_BASELINE) {
+        /* Baseline chunk (type 0x07) — reassembled by baseline.c. A chunk is a
+         * valid downlink, so the gateway is alive: keep the lost-counter down. */
+        baseline_handle_chunk(buf, len);
+        config_reset_gw_lost();
+        return 1;
+    }
+
+    if (buf[1] == PKT_TYPE_CMD && len >= (int)sizeof(lora_cmd_packet_t)) {
         lora_cmd_packet_t cmd;
         memcpy(&cmd, buf, sizeof(cmd));
-        uint8_t calc = crc8_xor((uint8_t *)&cmd, 5);
-        ESP_LOGI(TAG, "Downlink cmd: dest=0x%02X type=0x%02X cmd=0x%02X p1=0x%02X p2=0x%02X crc=0x%02X (calc=0x%02X)",
-                 cmd.dest, cmd.type, cmd.cmd, cmd.param1, cmd.param2, cmd.crc, calc);
+        uint8_t calc = crc8_xor((uint8_t *)&cmd, sizeof(cmd) - 1);
+        ESP_LOGI(TAG, "Downlink cmd: dest=0x%02X type=0x%02X cmd=0x%02X p1=0x%02X p2=0x%02X slot=%u crc=0x%02X (calc=0x%02X)",
+                 cmd.dest, cmd.type, cmd.cmd, cmd.param1, cmd.param2, cmd.slot, cmd.crc, calc);
 
         if (cmd.crc != calc) {
             ESP_LOGW(TAG, "Downlink CRC mismatch - NOT acknowledging (spec A)");
             lora_flush();
-            return 0;
+            return -1;
         }
         if (cmd.dest != 0xFF && cmd.dest != cfg->nodeId) {
             ESP_LOGI(TAG, "Downlink for node 0x%02X - ignoring, no ACK", cmd.dest);
             lora_flush();
-            return 0;
+            return -1;
         }
+        /* Every valid downlink carries the gateway's current slot → time sync. */
+        config_set_current_slot(cmd.slot);
+
         ESP_LOGI(TAG, "Valid downlink command 0x%02X - processing", cmd.cmd);
         commands_process(&cmd, data);
         config_reset_gw_lost();
@@ -160,7 +293,9 @@ static int commands_wait_downlink(const sensor_data_t *data)
         }
         ESP_LOGI(TAG, "gatewayLostCount reset to 0 (valid downlink)");
         return 1;
-    } else if (buf[1] == PKT_TYPE_ACK && len >= 8) {
+    }
+
+    if (buf[1] == PKT_TYPE_ACK && len >= 8) {
         lora_data_packet_t pkt;
         memcpy(&pkt, buf, sizeof(pkt));
         if (pkt.node_id == cfg->nodeId && crc8_verify((uint8_t *)&pkt, sizeof(pkt)) == 0) {
@@ -171,12 +306,59 @@ static int commands_wait_downlink(const sensor_data_t *data)
         }
         ESP_LOGW(TAG, "Gateway ACK wrong node / bad CRC - ignoring");
         lora_flush();
-        return 0;
+        return -1;
     }
 
     ESP_LOGD(TAG, "Unexpected downlink type 0x%02X - discarding", buf[1]);
     lora_flush();
     return 0;
+}
+
+/**
+ * @brief Open the post-uplink downlink window and handle EVERYTHING the gateway
+ *        sends (spec: it flushes its command cache — and any pending baseline
+ *        chunks — immediately after receiving data/heartbeat/alarm).
+ *
+ * The window is drained until the line goes idle, using short idle gaps so a
+ * plain ACK still closes it quickly (power).
+ *
+ * @param data Current sensor readings (used by REPORT, may be NULL)
+ * @return 1 if a valid downlink was received (gateway alive), 0 otherwise
+ */
+static int commands_wait_downlink(const sensor_data_t *data)
+{
+    uint8_t buf[BASELINE_MAX_FRAME];
+    int len = 0;
+    int result = 0;
+
+    ESP_LOGI(TAG, "Downlink window open (%d ms)", DOWNLINK_WINDOW_MS);
+
+    if (lora_receive_frame(buf, sizeof(buf), &len, DOWNLINK_WINDOW_MS) != 1) {
+        ESP_LOGI(TAG, "Downlink window closed - no downlink received");
+        return 0;
+    }
+
+    int r = process_downlink_frame(buf, len, data);
+    if (r == 1) result = 1;
+
+    /* Drain the rest of the burst: keep reading while frames keep arriving. */
+    uint32_t gap_ms = (buf[1] == PKT_TYPE_BASELINE) ? DOWNLINK_BURST_GAP_MS
+                                                    : DOWNLINK_IDLE_GAP_MS;
+    uint64_t start_us = (uint64_t)esp_timer_get_time();
+
+    while ((((uint64_t)esp_timer_get_time() - start_us) / 1000) < DOWNLINK_BURST_MAX_MS) {
+        if (lora_receive_frame(buf, sizeof(buf), &len, (int)gap_ms) != 1) {
+            break;                                  /* line idle → burst over */
+        }
+        if (process_downlink_frame(buf, len, data) == 1) result = 1;
+        gap_ms = (buf[1] == PKT_TYPE_BASELINE) ? DOWNLINK_BURST_GAP_MS
+                                               : DOWNLINK_IDLE_GAP_MS;
+    }
+
+    if (result == 0) {
+        ESP_LOGI(TAG, "Downlink window closed - nothing usable");
+    }
+    return result;
 }
 
 /**
@@ -434,10 +616,14 @@ int commands_process(const lora_cmd_packet_t *packet, const sensor_data_t *data)
 
     switch (packet->cmd) {
         case CMD_SET_INTERVAL: {
-            uint16_t interval = packet->param1 | (packet->param2 << 8);
-            if (interval < 5) interval = 5;
-            config_set_sleep_time(interval);
-            ESP_LOGI(TAG, "Cmd: Set sleep interval = %u s", interval);
+            /* Runtime-configurable deep-sleep period (initial default 300 s).
+             * config_set_sleep_time() clamps to [5, 3600] s and keeps the value
+             * in RTC config, so it survives deep-sleep cycles. The gateway
+             * applies the same change to its own node entry
+             * (node_set_sleep_interval) and derives the per-node offline
+             * timeout from it, so both sides stay in sync. */
+            uint16_t requested = packet->param1 | (packet->param2 << 8);
+            config_set_sleep_time(requested);
             break;
         }
 
@@ -445,13 +631,14 @@ int commands_process(const lora_cmd_packet_t *packet, const sensor_data_t *data)
             uint16_t duration = packet->param1 | (packet->param2 << 8);
             pump_on();
             if (duration > 0) {
-                cfg->pumpBySchedule = true;
-                cfg->scheduleDuration = duration;
-                config_save();
+                /* Timed run: the deadline lives on the RTC clock, so the pump
+                 * keeps running for the full duration even if the node wakes up
+                 * early for another reason (park, button, gateway polling). */
+                irrigation_start_timed_run(duration);
                 ESP_LOGI(TAG, "Cmd: Relay ON for %u seconds", duration);
             } else {
-                cfg->pumpBySchedule = false;
-                config_save();
+                /* Infinite ON = manual hold, no automatic switch-off. */
+                irrigation_cancel_timed_run();
                 ESP_LOGI(TAG, "Cmd: Relay ON (infinite)");
             }
             break;
@@ -459,8 +646,7 @@ int commands_process(const lora_cmd_packet_t *packet, const sensor_data_t *data)
 
         case CMD_RELAY_OFF: {
             pump_off();
-            cfg->pumpBySchedule = false;
-            config_save();
+            irrigation_cancel_timed_run();
             ESP_LOGI(TAG, "Cmd: Relay OFF");
             break;
         }
@@ -499,6 +685,9 @@ int commands_process(const lora_cmd_packet_t *packet, const sensor_data_t *data)
 
         case CMD_TOGGLE_PUMP: {
             pump_toggle();
+            /* A manual toggle is an explicit override: end any timed run so its
+             * deadline cannot switch the pump off later on. */
+            irrigation_cancel_timed_run();
             ESP_LOGI(TAG, "Cmd: Toggle pump -> %s", pump_get_state() ? "ON" : "OFF");
             break;
         }
@@ -722,43 +911,253 @@ int commands_send_alarm(uint8_t node_id, uint8_t alarm_code, const sensor_data_t
 
 int commands_check_pending(const sensor_data_t *data)
 {
-    app_config_t *cfg = config_get();
-    uint8_t buf[8];
+    uint8_t buf[BASELINE_MAX_FRAME];
     int len = 0;
+    int rc  = 1;                    /* 1 = nothing consumed */
 
     /* Give the module a moment to push any buffered frame into UART */
     vTaskDelay(pdMS_TO_TICKS(20));
 
-    if (lora_receive_frame(buf, &len, PENDING_WINDOW_MS) != 1) {
+    if (lora_receive_frame(buf, sizeof(buf), &len, PENDING_WINDOW_MS) != 1) {
         return 1;   /* No packet pending */
     }
 
-    if (buf[1] != PKT_TYPE_CMD) {
-        ESP_LOGD(TAG, "Non-command packet type 0x%02X - discarding", buf[1]);
-        lora_flush();
-        return 1;
+    /* Same frame handling as the post-uplink window (shared helper). */
+    int r = process_downlink_frame(buf, len, data);
+    if (r == 1)      rc = 0;
+    else if (r < 0)  rc = -1;
+
+    /* Drain the rest of a burst (baseline push / several cached commands). */
+    uint32_t gap_ms = (buf[1] == PKT_TYPE_BASELINE) ? DOWNLINK_BURST_GAP_MS
+                                                    : DOWNLINK_IDLE_GAP_MS;
+    uint64_t start_us = (uint64_t)esp_timer_get_time();
+
+    while ((((uint64_t)esp_timer_get_time() - start_us) / 1000) < DOWNLINK_BURST_MAX_MS) {
+        if (lora_receive_frame(buf, sizeof(buf), &len, (int)gap_ms) != 1) {
+            break;                                  /* line idle → burst over */
+        }
+        if (process_downlink_frame(buf, len, data) == 1) {
+            rc = 0;
+        } else if (rc != 0) {
+            rc = -1;
+        }
+        gap_ms = (buf[1] == PKT_TYPE_BASELINE) ? DOWNLINK_BURST_GAP_MS
+                                               : DOWNLINK_IDLE_GAP_MS;
+    }
+    return rc;
+}
+
+/* ──────────── Boot sync: baseline / time request ──────────── */
+
+int commands_send_req(uint8_t flags, uint8_t series_mask)
+{
+    app_config_t *cfg = config_get();
+    uint8_t buf[8];
+
+    buf[0] = cfg->nodeId;
+    buf[1] = PKT_TYPE_REQ;        /* 0x09 */
+    buf[2] = flags;
+    buf[3] = series_mask & 0x07u;
+    buf[4] = 0;
+    buf[5] = 0;
+    buf[6] = 0;
+    buf[7] = crc8_xor(buf, 7);
+
+    for (int i = 0; i < ACK_SEND_RETRIES; i++) {
+        if (lora_send(buf, sizeof(buf)) == sizeof(buf)) {
+            ESP_LOGI(TAG, "REQ sent (flags=0x%02X mask=0x%02X)", flags, series_mask);
+            return 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    lora_cmd_packet_t cmd_pkt;
-    memcpy(&cmd_pkt, buf, 6);
+    ESP_LOGW(TAG, "REQ transport failed (flags=0x%02X)", flags);
+    return -1;
+}
 
-    uint8_t expected_crc = crc8_xor((uint8_t *)&cmd_pkt, 5);
-    if (cmd_pkt.crc != expected_crc) {
-        ESP_LOGW(TAG, "Command CRC mismatch: got 0x%02X, expected 0x%02X - NO ACK",
-                 cmd_pkt.crc, expected_crc);
-        lora_flush();
-        return -1;
+/**
+ * @brief Commit a fully-received baseline session and tell the gateway.
+ *
+ * Exposed so BOTH the boot-sync listen window and the normal downlink window
+ * can finish the transfer the instant the last chunk lands. Waiting for the
+ * whole listen window left the gateway believing the transfer was still
+ * pending, so it re-flushed every chunk on each opportunity (chunk storm).
+ *
+ * @return bitmask of series newly committed (0 = nothing to report yet)
+ */
+int commands_finish_baseline_if_ready(void)
+{
+    if (!baseline_session_active() || !baseline_session_complete()) return 0;
+
+    uint8_t done = baseline_commit();
+    if (done == 0) return 0;
+
+    /* Báo lại TẤT CẢ serie node đang có trong NVS chứ không chỉ serie vừa
+     * commit: 0x08 là idempotent, nên nếu lần trước gateway mất 1 frame DONE
+     * trên không thì lần này nó được gửi lại — tránh việc gateway phải giữ lượt
+     * của node này trong khi node đã có đủ dữ liệu. */
+    uint8_t report = (uint8_t)(baseline_valid_mask() & 0x07u);
+    ESP_LOGI(TAG, "Baseline stored (mask=0x%02X) at slot t=%u - reporting 0x%02X to gateway",
+             done, config_get_slot(), report);
+
+    /* Gộp các serie CÙNG version vào 1 frame bitmask → bình thường (lần cấp đầu,
+     * cả 3 serie đều v1) chỉ phát ĐÚNG 1 frame 0x08 thay vì 3 frame liền nhau. */
+    uint8_t left = report;
+    int     sent = 0;
+    while (left != 0) {
+        uint8_t s = 0;
+        while (s < BASELINE_SERIES_COUNT && !(left & (uint8_t)(1u << s))) s++;
+        if (s >= BASELINE_SERIES_COUNT) break;
+
+        uint8_t v     = baseline_version(s);
+        uint8_t group = 0;
+        for (uint8_t k = 0; k < BASELINE_SERIES_COUNT; k++) {
+            if ((left & (uint8_t)(1u << k)) && baseline_version(k) == v) {
+                group |= (uint8_t)(1u << k);
+            }
+        }
+
+        if (sent > 0) vTaskDelay(pdMS_TO_TICKS(BASELINE_DONE_GAP_MS));
+        commands_send_baseline_done_mask(group, v);
+        left &= (uint8_t)~group;
+        sent++;
+    }
+    return (int)done;
+}
+
+void commands_wait_baseline(uint32_t timeout_ms)
+{
+    app_config_t *cfg = config_get();
+    uint8_t buf[BASELINE_MAX_FRAME];
+    int  len = 0;
+    uint32_t start      = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t last_rx_ms = start;
+    uint32_t last_ack_ms = 0;
+    bool     got_chunk  = false;
+
+    while ((uint32_t)(esp_timer_get_time() / 1000) - start < timeout_ms) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (lora_receive_frame(buf, sizeof(buf), &len, 500) != 1) {
+            /* Line im trong slice này: đủ slot + đủ 3 serie ⇒ xong. */
+            if (config_slot_valid() && baseline_valid_mask() == 0x07u) break;
+
+            /* Line im ≥ BASELINE_BURST_IDLE_MS kể từ chunk cuối ⇒ burst của
+             * gateway đã phát xong. CHỈ BÂY GIỜ mới commit + phát 0x08 (xem lý
+             * do bán song công ở BASELINE_BURST_IDLE_MS). Nhờ vậy gateway nghe
+             * được DONE và không còn phải flush lại từ serie 0. */
+            if (got_chunk &&
+                (uint32_t)(now_ms - last_rx_ms) >= BASELINE_BURST_IDLE_MS) {
+                if (commands_finish_baseline_if_ready() != 0) {
+                    got_chunk   = false;
+                    last_ack_ms = now_ms;
+                }
+                if (config_slot_valid() && baseline_valid_mask() == 0x07u) break;
+
+                /* Đã báo xong các serie nhận được mà line vẫn im thêm 1 s ⇒
+                 * hết đợt: kết thúc window để boot loop gửi REQ mới ngay thay
+                 * vì ngồi im hết 30 s. */
+                if (last_ack_ms != 0 &&
+                    (uint32_t)(now_ms - last_ack_ms) >= 1000u) {
+                    ESP_LOGI(TAG, "Boot sync: burst ended (mask=0x%02X) - re-requesting",
+                             baseline_valid_mask());
+                    break;
+                }
+            }
+            continue;   /* nothing yet — keep waiting */
+        }
+
+        last_rx_ms = now_ms;
+
+        /* Frame không gửi cho mình (downlink của node khác, hoặc uplink của node
+         * khác nghe được trên kênh chung) → bỏ qua, không đổi state. */
+        if (buf[0] != 0xFF && buf[0] != cfg->nodeId) {
+            ESP_LOGD(TAG, "Boot sync: frame for node 0x%02X - ignoring", buf[0]);
+            continue;
+        }
+
+        if (buf[1] == PKT_TYPE_BASELINE) {
+            got_chunk = true;
+            baseline_handle_chunk(buf, len);
+            config_reset_gw_lost();
+
+            /* KHÔNG commit/không phát 0x08 ở đây: phải chờ burst của gateway
+             * phát xong (xem BASELINE_BURST_IDLE_MS ở nhánh timeout). */
+            continue;
+        }
+
+        if (buf[1] == PKT_TYPE_CMD && len >= (int)sizeof(lora_cmd_packet_t)) {
+            lora_cmd_packet_t cmd;
+            memcpy(&cmd, buf, sizeof(cmd));
+            if (cmd.crc != crc8_xor((uint8_t *)&cmd, sizeof(cmd) - 1)) {
+                ESP_LOGW(TAG, "Boot sync: downlink CRC mismatch - ignoring");
+                continue;
+            }
+            if (cmd.dest != 0xFF && cmd.dest != cfg->nodeId) {
+                ESP_LOGD(TAG, "Boot sync: downlink for node 0x%02X - ignoring",
+                         cmd.dest);
+                continue;
+            }
+            config_set_current_slot(cmd.slot);
+            commands_process(&cmd, NULL);
+            config_reset_gw_lost();
+            continue;
+        }
+
+        if (buf[1] == PKT_TYPE_ACK && len >= 8) {
+            /* Chỉ ACK gửi cho MÌNH mới chứng minh gateway còn sống: ACK của
+             * node khác cũng nghe được trên kênh chung. */
+            lora_data_packet_t ack;
+            memcpy(&ack, buf, sizeof(ack));
+            if (ack.node_id == cfg->nodeId &&
+                crc8_verify((uint8_t *)&ack, sizeof(ack)) == 0) {
+                config_reset_gw_lost();
+            } else {
+                ESP_LOGD(TAG, "Boot sync: ACK for node 0x%02X - ignoring",
+                         ack.node_id);
+            }
+            continue;
+        }
+    }
+}
+
+int commands_send_baseline_done(uint8_t series, uint8_t version)
+{
+    if (series >= BASELINE_SERIES_COUNT) return -1;
+    return commands_send_baseline_done_mask((uint8_t)(1u << series), version);
+}
+
+int commands_send_baseline_done_mask(uint8_t series_mask, uint8_t version)
+{
+    app_config_t *cfg = config_get();
+    uint8_t buf[8];
+
+    series_mask &= 0x07u;
+    if (series_mask == 0) return -1;
+
+    /* Trường series mang bitmask (>=3) hoặc chỉ số serie 0/1/2 khi chỉ 1 bit. */
+    uint8_t field = (series_mask == 0x01u) ? 0u :
+                    (series_mask == 0x02u) ? 1u :
+                    (series_mask == 0x04u) ? 2u : series_mask;
+
+    buf[0] = cfg->nodeId;
+    buf[1] = PKT_TYPE_BASELINE_DONE;   /* 0x08 */
+    buf[2] = field;
+    buf[3] = version;
+    buf[4] = 0;
+    buf[5] = 0;
+    buf[6] = 0;
+    buf[7] = crc8_xor(buf, 7);
+
+    for (int i = 0; i < ACK_SEND_RETRIES; i++) {
+        if (lora_send(buf, sizeof(buf)) == sizeof(buf)) {
+            ESP_LOGI(TAG, "BASELINE_DONE sent (mask=0x%02X field=%u v%u)",
+                     series_mask, field, version);
+            return 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    if (cmd_pkt.dest != 0xFF && cmd_pkt.dest != cfg->nodeId) {
-        ESP_LOGI(TAG, "Command for another node (0x%02X) - ignoring", cmd_pkt.dest);
-        lora_flush();
-        return 1;
-    }
-
-    ESP_LOGI(TAG, "Pending command 0x%02X - processing", cmd_pkt.cmd);
-    commands_process(&cmd_pkt, data);
-    config_reset_gw_lost();
-    ESP_LOGI(TAG, "gatewayLostCount reset to 0 (valid downlink)");
-    return 0;
+    ESP_LOGW(TAG, "BASELINE_DONE transport failed (mask=0x%02X)", series_mask);
+    return -1;
 }

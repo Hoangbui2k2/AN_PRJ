@@ -11,7 +11,11 @@ extern "C" {
 
 /* Maximum topic length */
 #define MQTT_TOPIC_MAX    64
-#define MQTT_PAYLOAD_MAX  256
+/* Maximum payload we accept from the broker.
+ * A full set_baseline table is 3 series × 96 points ≈ 2.9 KB, so 256 bytes
+ * (the old value) silently truncated it: cJSON then failed to parse and the
+ * node never received its baseline. */
+#define MQTT_PAYLOAD_MAX  4096
 
 /**
  * @brief Callback type for received MQTT commands

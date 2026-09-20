@@ -7,9 +7,11 @@ idf_component_register(
         mqtt.c
         node_manager.c
         command_cache.c
+        baseline_manager.c
         crc.c
         config.c
         topic.c
+        slot.c
         certs.c
     INCLUDE_DIRS
         .

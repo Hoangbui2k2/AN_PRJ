@@ -133,7 +133,7 @@ Packet length = `3 + popcount(presence) + 1 (crc)`.
 | Code | Command | Param1 | Param2 |
 | --- | --- | --- | --- |
 | 0x01 | Set interval | low byte (s) | high byte (s) |
-| 0x02 | Relay ON | duration lo (s, 0=inf) | duration hi |
+| 0x02 | Relay ON | duration lo (s, 0=inf) | duration hi | Timed run: deadline on the RTC clock, pump stops after the full duration even across extra wakes |
 | 0x03 | Relay OFF | - | - |
 | 0x04 | Set thresholds | low (%) | high (%) |
 | 0x05 | Set schedule | hour (0-23) | minute (0-59) |
@@ -175,12 +175,30 @@ Active alarm is signalled with 3× blink-pattern repeats, a 0x04 alarm packet is
 
 - Pump controlled only by the button or remote commands (0x02/0x07).
 - `irrigation_should_irrigate()` returns the current `pumpState`, no automatic toggle.
+- A remote **Relay ON with duration** starts a *timed run* (`irrigation_start_timed_run()`):
+  the deadline is stored on the RTC clock and the deep-sleep interval is shortened, so the
+  pump stops after exactly `duration` seconds even if the node wakes earlier for another
+  reason. Relay ON with duration 0 = manual hold (no automatic stop).
+- A button press / toggle / relay-off **cancels** a timed run (explicit manual override).
 
 ### Mode 1: Schedule
 
-- Requires a synchronized system clock (epoch ≥ 86400, i.e. one day).
-- Ignores the day-of-year once per day (`lastWateringDay`), runs for `scheduleDuration`, then turns the pump off and restores `normalInterval`.
-- While the scheduled pump is on, the deep-sleep interval is temporarily `scheduleDuration` so the node wakes to turn it off.
+- Runs on the **15-minute time axis (t = 0..95)** — no absolute clock needed. The
+  node only ever receives `slot` from the gateway (every downlink carries it), never
+  an epoch, so the schedule is evaluated on the same axis as the baseline:
+  `target_t = (hour * 60 + minute) / 15` (minutes snap DOWN to the slot).
+- Fires on the first wake with `t == target_t`, or up to `SCHEDULE_CATCHUP_SLOTS` (1)
+  slot later; once per day, tracked by the **slot-day counter** that increments at
+  every t=0 (midnight) wrap (`slotDay`, persisted in NVS with `lastWateringDay`).
+- Runs for `scheduleDuration`, then turns the pump off and restores `normalInterval`.
+- While the scheduled pump is on, the deep-sleep interval is temporarily `scheduleDuration`
+  so the node wakes to turn it off — but the run is protected by an **RTC-clock deadline**
+  (`irrigation_start_timed_run()`): a wake that happens earlier (park, gateway polling,
+  button press) keeps the pump ON and re-sleeps for the remaining seconds instead of
+  cutting the watering short. Manual control from the gateway (0x02/0x03/0x07) still ends it.
+- If `t` is not synced yet (`slot_valid == false`) the schedule check is skipped with a
+  warning. A time already in the past for today does NOT fire immediately — it takes
+  effect at the same slot on the next day.
 
 ### Mode 2: Threshold (default)
 
@@ -190,7 +208,12 @@ Active alarm is signalled with 3× blink-pattern repeats, a 0x04 alarm packet is
 ### Gateway Lost Fallback
 
 - Heartbeat with no downlink response → `gatewayLostCount++`.
-- At `gatewayLostCount ≥ GW_LOST_ALARM_THRESHOLD (3)` → `gatewayLost=true`, alarm 0x05, and `irrigation_gateway_lost()` switches mode to Schedule.
+- At `gatewayLostCount ≥ GW_LOST_ALARM_THRESHOLD (3)` → `gatewayLost=true`, alarm 0x05, and
+  `irrigation_gateway_lost()` switches to **Schedule mode ONLY if the node is currently in
+  THRESHOLD mode** (the automatic mode). MANUAL stays manual and SCHEDULE keeps its schedule;
+  those cases only log a warning.
+- The mode change is **not** undone automatically when the gateway returns: send an explicit
+  `set_mode` from the server if needed.
 - `gatewayLostCount` stays raised (not reset) so FLAG_GATEWAY_LOST stays set; a later valid downlink calls `config_reset_gw_lost()`.
 
 ---

@@ -25,6 +25,7 @@ typedef enum {
     TOPIC_NODE_ALARM,    /**< irrigation/<site>/<gw_id>/node_<node_id>/alarm */
     TOPIC_NODE_STATUS,   /**< irrigation/<site>/<gw_id>/node_<node_id>/status */
     TOPIC_NODE_CMD,      /**< irrigation/<site>/<gw_id>/node_<node_id>/cmd */
+    TOPIC_NODE_BASELINE, /**< irrigation/<site>/<gw_id>/node_<node_id>/baseline */
     TOPIC_GW_STATUS,     /**< irrigation/<site>/<gw_id>/status */
     TOPIC_GW_CONFIG,     /**< irrigation/<site>/<gw_id>/config */
     TOPIC_GW_WILL,       /**< irrigation/<site>/<gw_id>/status (last will) */

@@ -15,7 +15,7 @@ USAGE
      tools/certs/private_key.pem
 
 2. From an ESP-IDF terminal, run:
-     python tools/gen_certs_nvs.py --port COM10
+     python tools/gen_certs_nvs.py --port COM12
 
    Optional flags:
      --no-flash         Only generate certs.bin, do not flash.

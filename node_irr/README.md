@@ -68,10 +68,10 @@ To reach the <100µA deep-sleep target, external resistors are required for GPIO
 ### Operation Modes
 
 1. **Manual (Mode 0)**: Button-controlled pump operation only (or remote command).
-2. **Schedule (Mode 1)**: Time-based irrigation (once per day, needs time sync).
+2. **Schedule (Mode 1)**: Slot-based irrigation — runs once per day at the `t` (15-minute slot) derived from the configured hour/minute; needs a synced slot, not an absolute clock.
 3. **Threshold (Mode 2)**: Soil moisture-based irrigation (default).
 
-Gateway-lost fallback: no downlink after heartbeat → `gatewayLostCount++`; at 3 → GW_LOST flag + alarm + automatic switch to Schedule mode until a valid downlink restores.
+Gateway-lost fallback: no downlink after heartbeat → `gatewayLostCount++`; at 3 → GW_LOST flag + alarm + automatic switch to Schedule mode — **only when the node is in THRESHOLD (automatic) mode** — until the server changes the mode again.
 
 ### Alarm System
 

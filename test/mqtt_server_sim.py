@@ -13,7 +13,7 @@ Chế độ hoạt động (mode):
        - Duy trì bảng trạng thái node / gateway
        - Cho phép gửi lệnh thủ công tới node
 
-  2. SUITE (--suite file.json):
+  2. SUITE (--python mqtt_server_sim.py --broker mqtts://d246c46a2ebe40d2ae0c787f92bfdbab.s1.eu.hivemq.cloud --port 8883 --user hivemq.webclient.1742180699133 --pass "#x1V7:H62pCZ%e&nGkgR" --site HCM --gw gw_01 --nodes 1,2 --suite suites/baseline_provision.json file.json):
        - Đọc kịch bản test từ file JSON
        - Publish lệnh, chờ + verify payload nhận được (schema/giá trị)
        - In PASS/FAIL, ghi báo cáo `reports/<run_id>.json` + `.md`
@@ -100,6 +100,16 @@ SCHEMAS = {
         "types": {"node": (int,), "type": (str,), "message": (str,)},
         # alarm do node gửi (3a) có: alarm_code, flags
         # alarm do gateway phát hiện ngưỡng (3b) có: soil, threshold_low, threshold_high
+    },
+    "baseline": {
+        # irrigation/<site>/<gw>/node_XX/baseline
+        #   request : node xin baseline (node tự gửi REQ 0x09 khi thiếu)
+        #   done    : node đã lưu xong 1 series (uplink 0x08)
+        "required": ["node", "status"],
+        "types": {"node": (int,), "status": (str,),
+                  "series": (int,), "version": (int,), "series_mask": (int,)},
+        "enums": {"status": ("request", "done")},
+        "ranges": {"series": (0, 2), "series_mask": (0, 7), "version": (1, 255)},
     },
     "gw_status": {
         "required": ["status"],
@@ -268,7 +278,7 @@ class ServerSim:
 
 def topic_kind(topic, site, gw):
     """Phân loại topic nhận được. Trả về ('data'|'status'|'alarm'|'gw_status'|'other', node_id)."""
-    m = re.search(r"node_([0-9A-Fa-f]{1,2})/(data|status|alarm|cmd)$", topic)
+    m = re.search(r"node_([0-9A-Fa-f]{1,2})/(data|status|alarm|cmd|baseline)$", topic)
     if m:
         return m.group(2), int(m.group(1), 16)
     if topic.endswith("/status") and "/node_" not in topic:
@@ -341,6 +351,69 @@ def run_suite(sim, suite_path, report_dir):
     sim.subscribe("irrigation/{}/{}/#".format(sim.site, sim.gw), qos=1)
     time.sleep(1.0)  # chờ subscribe ack
 
+    # Message KHÔNG khớp bước đang chờ được GIỮ LẠI ở đây thay vì vứt đi: khi có
+    # nhiều node cùng hoạt động, thứ tự tới không xác định (request của node 2 có
+    # thể vượt request của node 1), nên bước sau vẫn phải match được chúng.
+    pending = []
+    PENDING_MAX = 300
+
+    def _msg_matches(msg, expect_msg):
+        exp = dict(expect_msg or {})
+        exp["_msg"] = msg
+        return check_message(sim, exp)
+
+    def _payload_of(msg):
+        raw = msg[1]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    # ── Tự động cấp lại bảng baseline khi gateway MẤT bảng ──
+    # Session baseline của gateway chỉ nằm trong RAM: nếu gateway reset giữa lúc
+    # đang gửi chunk (đã gặp: 'rst:0x1 (POWERON_RESET)' ngay sau 'TX complete'),
+    # bảng mất và node sẽ REQ mãi mà không bao giờ 'done'. Gateway phát hiện và
+    # publish 'needed=1'; runner gửi lại đúng message set_baseline đã push trước đó.
+    last_cmd = {}       # node_id -> payload set_baseline gần nhất
+    repush_count = {}   # node_id -> số lần đã gửi lại
+    warned_no_cmd = set()   # node_id -> đã cảnh báo "chưa có bảng để gửi lại"
+    repush_last = {}    # node_id -> thời điểm gửi lại gần nhất (giây)
+    REPUSH_MAX = 5
+    REPUSH_MIN_GAP_S = 5.0
+
+    def _maybe_repush(msg):
+        obj = _payload_of(msg)
+        if not obj or obj.get("status") != "request" or not obj.get("needed"):
+            return
+        nid = obj.get("node")
+        cmd = last_cmd.get(nid)
+        if cmd is None:
+            # Suite chủ động KHÔNG push bảng cho node này với (ví dụ
+            # baseline_relay_sequential chỉ push khi nhận được request đã relay).
+            if nid not in warned_no_cmd:
+                warned_no_cmd.add(nid)
+                print("  ! Gateway cần lại bảng baseline cho node {} nhưng suite chưa "
+                      "từng publish - bỏ qua (cảnh báo chỉ in 1 lần)".format(nid))
+            return
+        if repush_count.get(nid, 0) >= REPUSH_MAX:
+            if nid not in warned_no_cmd:
+                warned_no_cmd.add(nid)
+                print("  ! Node {} vẫn cần bảng sau {} lần gửi lại - bỏ qua".format(
+                    nid, REPUSH_MAX))
+            return
+        now_s = time.time()
+        if now_s - repush_last.get(nid, 0.0) < REPUSH_MIN_GAP_S:
+            return
+        repush_last[nid] = now_s
+        repush_count[nid] = repush_count.get(nid, 0) + 1
+        print("  ↻ Gateway MẤT bảng của node {} → tự động push lại ({}/{}): {}".format(
+            nid, repush_count[nid], REPUSH_MAX, _short(json.dumps(cmd))))
+        sim.publish_cmd(nid, cmd)
+
+    step_name = "(chưa bắt đầu)"
+    interrupted = False
     try:
         deadline = time.time() + global_timeout
         for step in suite.get("steps", []):
@@ -348,8 +421,15 @@ def run_suite(sim, suite_path, report_dir):
             step_name = step.get("name", action)
             print("\n-- Bước: {} [{}] --".format(step_name, action))
 
+            # 'needed' có thể đã bị đệm từ bước trước → xử lý TRƯỚC khi bước này
+            # tiêu thụ nó (nếu để bước 'expect request' ăn mất thì bảng không được
+            # gửi lại và node sẽ kẹt).
+            for m in list(pending):
+                _maybe_repush(m)
+
             if action == "publish_cmd":
                 sim.publish_cmd(step["node"], step["cmd"])
+                last_cmd[int(step["node"])] = step["cmd"]
                 results.append((step_name, "PUBLISHED", True))
                 continue
 
@@ -370,25 +450,95 @@ def run_suite(sim, suite_path, report_dir):
                 step_deadline = time.time() + min(step_timeout,
                                                   max(0, deadline - time.time()))
                 matched = False
-                while time.time() < step_deadline:
+                expect_msg = step.get("expect_msg", {})
+
+                # 1) Message đã được đệm từ bước trước có thể đã thoả rồi.
+                for i, msg in enumerate(pending):
+                    ok, _ = _msg_matches(msg, expect_msg)
+                    if ok:
+                        pending.pop(i)
+                        matched = True
+                        print("  ✓ khớp message đệm sẵn: {} {}".format(
+                            msg[0], _short(msg[1])))
+                        break
+
+                # 2) Chưa có thì chờ message mới; message không khớp thì đệm lại.
+                while not matched and time.time() < step_deadline:
                     msg = sim.drain(timeout=min(1.0, max(0, step_deadline - time.time())))
                     if msg is None:
                         continue
-                    expect = dict(step.get("expect_msg", {}))
-                    expect["_msg"] = msg
-                    ok, err = check_message(sim, expect)
+                    _maybe_repush(msg)
+                    ok, err = _msg_matches(msg, expect_msg)
                     if ok:
                         matched = True
                         print("  ✓ nhận được message thoả: {} {}".format(
                             msg[0], _short(msg[1])))
                         break
-                    else:
-                        print("  - bỏ qua message ({}): {} {}".format(
-                            err, msg[0], _short(msg[1])))
+                    if len(pending) < PENDING_MAX:
+                        pending.append(msg)
+                    print("  - đệm lại cho bước sau ({}): {} {}".format(
+                        err, msg[0], _short(msg[1])))
                 if matched:
                     results.append((step_name, "PASS", True))
                 else:
                     results.append((step_name, "FAIL", False))
+                continue
+
+            if action == "assert_not_seen":
+                # Khẳng định KHÔNG có message nào khớp (đã đệm hoặc mới tới).
+                # Dùng để kiểm tra THỨ TỰ, ví dụ: node 2 KHÔNG được gửi 'done'
+                # trước khi node 1 hoàn tất (gateway cấp baseline tuần tự).
+                topic_re = step.get("topic_regex", "")
+                want = step.get("expect", {})
+
+                def _is_seen(m):
+                    if topic_re and not re.search(topic_re, m[0]):
+                        return False
+                    if not want:
+                        return True
+                    obj = _payload_of(m)
+                    return bool(obj) and all(obj.get(k) == v for k, v in want.items())
+
+                bad = [m for m in pending if _is_seen(m)]
+
+                # Drain everything ALREADY queued (non-blocking): một vi phạm đã
+                # tới nhưng chưa được bước nào lấy ra vẫn phải bị phát hiện.
+                while not bad:
+                    msg = sim.drain(timeout=0)
+                    if msg is None:
+                        break
+                    _maybe_repush(msg)
+                    if _is_seen(msg):
+                        bad.append(msg)
+                        break
+                    if len(pending) < PENDING_MAX:
+                        pending.append(msg)
+
+                # Cửa sổ chờ thêm cho message đang bay tới. Mặc định 0 vì nhiều
+                # trường hợp message tới sau là HỢP LỆ (ví dụ node kế tiếp được
+                # chuyển lượt ngay sau khi node trước xong).
+                settle = step.get("settle_seconds", 0)
+                if not bad and settle > 0:
+                    settle_deadline = time.time() + settle
+                    while time.time() < settle_deadline:
+                        msg = sim.drain(timeout=0.5)
+                        if msg is None:
+                            continue
+                        _maybe_repush(msg)
+                        if _is_seen(msg):
+                            bad.append(msg)
+                            break
+                        if len(pending) < PENDING_MAX:
+                            pending.append(msg)
+
+                if bad:
+                    print("  ✗ VI PHẠM THỨ TỰ: đã thấy message không được phép: {} {}".format(
+                        bad[0][0], _short(bad[0][1])))
+                    results.append((step_name, "FAIL", False))
+                else:
+                    print("  ✓ không thấy message cấm (đã kiểm tra pending + queue, chờ thêm {}s)".format(
+                        settle))
+                    results.append((step_name, "PASS", True))
                 continue
 
             print("  !! action không biết: '{}'".format(action))
@@ -401,11 +551,49 @@ def run_suite(sim, suite_path, report_dir):
         print("  Thời gian: {:.1f}s".format(elapsed))
         for name_, status, ok in results:
             print("    [{}] {}".format("PASS" if ok else "FAIL", name_))
+        if pending:
+            print("  (còn {} message không khớp bước nào - xem log phía trên)".format(
+                len(pending)))
+    except KeyboardInterrupt:
+        # Ctrl+C: dừng gọn, KHÔNG để traceback kép từ cleanup. Bước đang chờ bị
+        # đánh dấu INTERRUPTED, các bước đã chạy vẫn được ghi vào báo cáo.
+        interrupted = True
+        print("\n⏹  DỪNG BỞI NGƯỜI DÙNG (Ctrl+C) khi đang ở bước: {}".format(step_name))
+        results.append((step_name + " (bị dừng giữa chừng)", "INTERRUPTED", False))
     finally:
-        sim.client.loop_stop()
+        _safe_stop(sim)
 
-    _write_report(report_dir, suite, results, elapsed=time.time() - start_all)
-    return passed == len(results)
+    elapsed = time.time() - start_all
+    passed = sum(1 for r in results if r[2])
+    print("\n===== KẾT QUẢ {} =====".format("SUITE" if not interrupted else "SUITE (một phần, đã dừng)"))
+    print("  Pass: {}/{}".format(passed, len(results)))
+    print("  Thời gian: {:.1f}s".format(elapsed))
+    for name_, status, ok in results:
+        print("    [{}] {}".format("PASS" if ok else "FAIL", name_))
+    if pending:
+        print("  (còn {} message không khớp bước nào - xem log phía trên)".format(
+            len(pending)))
+
+    _write_report(report_dir, suite, results, elapsed=elapsed,
+                  leftover=len(pending))
+    return (not interrupted) and passed == len(results)
+
+
+def _safe_stop(sim):
+    """Dừng MQTT an toàn.
+
+    `client.loop_stop()` join thread nội bộ của paho; nếu người dùng bấm Ctrl+C
+    lần thứ hai (hoặc lúc join) thì chính cleanup lại ném KeyboardInterrupt →
+    traceback kép rất khó đọc. Ở đây nuốt mọi lỗi cleanup để luôn thoát sạch.
+    """
+    for fn_name in ("disconnect", "loop_stop"):
+        fn = getattr(sim.client, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            fn()
+        except BaseException:      # gồm cả KeyboardInterrupt ở lần Ctrl+C thứ 2
+            pass
 
 
 def _short(payload, n=120):
@@ -414,7 +602,7 @@ def _short(payload, n=120):
     return payload if len(payload) <= n else payload[:n] + "..."
 
 
-def _write_report(report_dir, suite, results, elapsed):
+def _write_report(report_dir, suite, results, elapsed, leftover=0):
     os.makedirs(report_dir, exist_ok=True)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     base = os.path.join(report_dir, "{}_{}".format(run_id, suite.get("name", "suite")))
@@ -425,6 +613,7 @@ def _write_report(report_dir, suite, results, elapsed):
         "passed": passed,
         "total": len(results),
         "elapsed_seconds": round(elapsed, 1),
+        "unmatched_leftover": leftover,
         "results": [{"step": n, "status": s, "ok": ok} for n, s, ok in results],
     }
     with open(base + ".json", "w", encoding="utf-8") as f:
@@ -568,6 +757,37 @@ def check_schema_mode(sim, msg_type, timeout):
 
 # ──────────────────────────── main ────────────────────────────
 
+def _resolve_suite(arg):
+    """
+    Tìm file suite theo nhiều cách để khỏi phải gõ đúng đường dẫn:
+      baseline_provision             -> <test>/suites/baseline_provision.json
+      baseline_provision.json        -> <test>/suites/baseline_provision.json
+      suites/baseline_provision.json -> giữ nguyên
+    Trả về đường dẫn tồn tại, hoặc None nếu không thấy.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    names = [arg] if arg.endswith(".json") else [arg, arg + ".json"]
+    cands = []
+    for n in names:
+        cands.append(n)
+        if not os.path.isabs(n) and os.sep not in n and "/" not in n:
+            cands.append(os.path.join("suites", n))
+    for c in cands:
+        p = c if os.path.isabs(c) else os.path.join(here, c)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _list_suites():
+    """Danh sách các suite có sẵn trong thư mục suites/."""
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "suites")
+    try:
+        return sorted(f for f in os.listdir(d) if f.endswith(".json"))
+    except OSError:
+        return []
+
+
 def main():
     # Windows console mặc định cp1258 không in được tiếng Việt — ép stdout UTF-8
     for _stream in (sys.stdout, sys.stderr):
@@ -590,7 +810,8 @@ def main():
                     help="Bỏ qua verify TLS certificate")
     ap.add_argument("-l", "--listen", action="store_true",
                     help="Listen mode (in mọi message + gửi lệnh thủ công)")
-    ap.add_argument("--suite", default="", help="Chạy suite JSON")
+    ap.add_argument("--suite", default="",
+                    help="Chạy suite JSON (có thể ghi tắt tên file: '--suite baseline_provision')")
     ap.add_argument("--check-schema", choices=list(SCHEMAS.keys()),
                     help="Chờ 1 message và validate schema")
     ap.add_argument("--timeout", type=int, default=30,
@@ -600,6 +821,20 @@ def main():
     args = ap.parse_args()
     nodes = [int(x) for x in args.nodes.split(",") if x.strip()]
 
+    # Tìm suite TRƯỚC khi kết nối: báo lỗi sớm và tránh mở MQTT vô ích.
+    suite_path = ""
+    if args.suite:
+        suite_path = _resolve_suite(args.suite)
+        if not suite_path:
+            print("❌ Không tìm thấy suite '{}'".format(args.suite))
+            avail = _list_suites()
+            if avail:
+                print("   Suite có sẵn trong suites/ :")
+                for f in avail:
+                    print("     - suites/{}".format(f))
+            print("   Ví dụ: --suite suites/baseline_provision_new_schema.json")
+            sys.exit(2)
+
     sim = ServerSim(args.broker, args.port, args.user, args.password,
                     args.site, args.gw, nodes=nodes, insecure=args.insecure)
 
@@ -607,13 +842,28 @@ def main():
         sys.exit(1)
 
     if args.suite:
-        ok = run_suite(sim, args.suite, args.report_dir)
+        try:
+            ok = run_suite(sim, suite_path, args.report_dir)
+        except KeyboardInterrupt:
+            print("\n⏹  Đã dừng bởi người dùng (Ctrl+C).")
+            _safe_stop(sim)
+            sys.exit(130)
         sys.exit(0 if ok else 1)
     elif args.check_schema:
-        ok = check_schema_mode(sim, args.check_schema, args.timeout)
+        try:
+            ok = check_schema_mode(sim, args.check_schema, args.timeout)
+        except KeyboardInterrupt:
+            print("\n⏹  Đã dừng bởi người dùng (Ctrl+C).")
+            _safe_stop(sim)
+            sys.exit(130)
         sys.exit(0 if ok else 1)
     else:
-        listen_mode(sim)
+        try:
+            listen_mode(sim)
+        except KeyboardInterrupt:
+            print("\n⏹  Đã dừng bởi người dùng (Ctrl+C).")
+        finally:
+            _safe_stop(sim)
 
 
 if __name__ == "__main__":

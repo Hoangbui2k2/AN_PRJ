@@ -4,7 +4,7 @@
   "timeout_seconds": 60,
   "steps": [
     {
-      "name": "Chụp pump hiện tại (baseline data #1)",
+      "name": "TC-F01: chụp data hiện tại (baseline data #1)",
       "action": "expect",
       "timeout": 20,
       "expect_msg": {
@@ -14,13 +14,13 @@
       }
     },
     {
-      "name": "Gửi lệnh toggle cho node 0x01",
+      "name": "TC-D06/TC-F01: gửi lệnh toggle cho node 0x01",
       "action": "publish_cmd",
       "node": 1,
       "cmd": {"cmd": "toggle"}
     },
     {
-      "name": "Chờ data mới xuất hiện (pump đổi)",
+      "name": "TC-F01: chờ data mới xuất hiện (pump đổi)",
       "action": "expect",
       "timeout": 25,
       "expect_msg": {

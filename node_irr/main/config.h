@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define NODE_ID 0x02
+#define NODE_ID 0x01
 /* ──────────── Operation Modes ──────────── */
 typedef enum {
     MODE_MANUAL    = 0,  /* Button-only pump control */
@@ -33,8 +33,42 @@ typedef enum {
 #define PKT_TYPE_HEARTBEAT   0x02  /* Node -> Gateway: heartbeat (8-byte fixed, legacy) */
 #define PKT_TYPE_ACK         0x03  /* Gateway -> Node / Node -> Gateway: ACK (8-byte fixed) */
 #define PKT_TYPE_ALARM       0x04  /* Node -> Gateway: alarm (8-byte fixed) */
-#define PKT_TYPE_CMD         0x05  /* Gateway -> Node: command (6-byte fixed) */
+#define PKT_TYPE_CMD         0x05  /* Gateway -> Node: command (7-byte fixed incl. slot) */
 #define PKT_TYPE_DATA_COMPACT 0x06 /* Node -> Gateway: compact sensor data (variable-length) */
+#define PKT_TYPE_BASELINE    0x07  /* Gateway -> Node: baseline chunk (variable-length) */
+#define PKT_TYPE_BASELINE_DONE 0x08 /* Node -> Gateway: one baseline series stored */
+#define PKT_TYPE_REQ         0x09  /* Node -> Gateway: request (time and/or baseline) */
+
+/* ──────────── Baseline request flags (PKT_TYPE_REQ, byte 2) ──────────── */
+#define REQ_FLAG_BASELINE    0x01  /* bit0: node needs baseline points */
+#define REQ_FLAG_TIME        0x02  /* bit1: node needs current slot */
+
+/* ──────────── Fixed 15-minute time axis (t = 0..95, 96 slots/day) ──────────── */
+#define SLOTS_PER_DAY        96
+#define SLOT_MINUTES         15
+#define SLOT_MS              900000UL     /* 15 * 60 * 1000 */
+#define SLOT_US              900000000ULL /* SLOT_MS * 1000 (µs per slot) */
+#define SLOT_MAX             95
+
+/* ──────────── Baseline deviation tolerances (send if dev >= tol) ──────────── */
+#define BASE_TOL_TEMP        1   /* °C   (baseline temp y = °C + 40, 1 unit = 1°C) */
+#define BASE_TOL_HUM         2   /* %    (baseline humidity y = 0..100) */
+#define BASE_TOL_SOIL        2   /* %    (baseline soil y = 0..100) */
+
+/* ──────────── Baseline series ids & sizing ──────────── */
+#define BASELINE_SERIES_TEMP 0
+#define BASELINE_SERIES_HUM  1
+#define BASELINE_SERIES_SOIL 2
+#define BASELINE_SERIES_COUNT 3
+#define BASELINE_MAX_POINTS  96   /* max points per series (one per 15-min slot) */
+#define BASELINE_POINTS_PER_CHUNK 10
+/* Chunk frame = dest|type|series|version|seq|total|n_points (7 B)
+ * + n_points * [t,y] (2 B each) + crc (1 B). Derived so the RX buffer always
+ * fits the largest chunk the gateway can send. */
+#define BASELINE_MAX_FRAME   (7 + 2 * BASELINE_POINTS_PER_CHUNK + 1)
+/* Max chunks per series = ceil(96 / 10) = 10. The reassembly session tracks the
+ * received chunks of each series with a 16-bit mask. */
+#define BASELINE_MAX_CHUNKS  ((BASELINE_MAX_POINTS + BASELINE_POINTS_PER_CHUNK - 1) / BASELINE_POINTS_PER_CHUNK)
 
 /* ──────────── Compact Packet Presence Bitmask (PKT_TYPE_DATA_COMPACT) ────────────
  *
@@ -83,6 +117,17 @@ typedef enum {
 #define THRESHOLD_HIGH_DEFAULT    70    /* Default upper threshold (%) */
 #define HEARTBEAT_CYCLES          5     /* Send heartbeat after N cycles without any uplink */
 
+/* Default (initial) deep-sleep period: 5 minutes = 300 s.
+ * This is only the STARTING value — the period is NOT hard-coded: the server
+ * can change it at runtime with CMD_SET_INTERVAL (0x01, 5..3600 s) and the node
+ * keeps it in RTC config across deep-sleep cycles. With the default value,
+ * 3 wake cycles == one 15-minute baseline slot (SLOT_MS / 1000). The gateway
+ * mirrors the commanded value (node_set_sleep_interval) and derives the
+ * per-node offline timeout from it, so both sides stay in sync. */
+#define NODE_SLEEP_INTERVAL_S     300
+#define SLEEP_INTERVAL_MIN_S      5     /* CMD_SET_INTERVAL clamp - keep in sync with power.h */
+#define SLEEP_INTERVAL_MAX_S      3600  /* CMD_SET_INTERVAL clamp - keep in sync with power.h */
+
 /* ──────────── Delta Thresholds (change since last send) ──────────── */
 #define TEMP_DELTA_THRESHOLD      20    /* 2.0°C, stored as °C × 10 */
 #define HUM_DELTA_THRESHOLD        5    /* 5% RH */
@@ -107,15 +152,38 @@ typedef enum {
 #define DELTA_TYPE_SOIL          2    /* param2 = % (default 10) */
 #define DELTA_TYPE_BATTERY       3    /* param2 = % (default 10) */
 
-/* ──────────── LoRa 6-byte Command Packet ──────────── */
+/* ──────────── LoRa 7-byte Command Packet (v2: +slot) ────────────
+ * Downlink frame layout:
+ *   0 dest | 1 type(0x05) | 2 cmd | 3 param1 | 4 param2 | 5 slot | 6 crc
+ * `slot` is the gateway's current 15-minute slot (0..95) and is present in
+ * EVERY downlink, so the node is time-synced on any exchange.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t dest;       /* 0xFF=broadcast or node ID */
     uint8_t type;       /* 0x05 = command */
     uint8_t cmd;        /* Command code */
     uint8_t param1;     /* Parameter 1 */
     uint8_t param2;     /* Parameter 2 */
-    uint8_t crc;        /* CRC8 of bytes 0-4 */
+    uint8_t slot;       /* Current slot 0..95 (SLOT_MAX) */
+    uint8_t crc;        /* CRC8 of bytes 0-5 */
 } lora_cmd_packet_t;
+
+/* ──────────── LoRa baseline chunk frame (GW -> Node, type 0x07) ────────────
+ *   0 dest | 1 type(0x07) | 2 series | 3 version | 4 seq | 5 total
+ *   6 n_points | 7.. payload (n_points * [t,y]) | crc
+ * Frame length = 7 + 2*n_points + 1.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t dest;
+    uint8_t type;       /* 0x07 */
+    uint8_t series;     /* BASELINE_SERIES_* */
+    uint8_t version;    /* baseline version, increments on each update */
+    uint8_t seq;        /* chunk index 0..total-1 */
+    uint8_t total;      /* number of chunks for this series */
+    uint8_t n_points;   /* points in this chunk */
+    uint8_t payload[BASELINE_POINTS_PER_CHUNK * 2]; /* [t, y] pairs */
+    uint8_t crc;        /* CRC8 of all preceding bytes */
+} lora_baseline_frame_t;
 
 /* ──────────── LoRa 8-byte Data Packet ──────────── */
 typedef struct __attribute__((packed)) {
@@ -155,7 +223,8 @@ typedef struct __attribute__((packed)) {
     uint32_t lastScheduleTime;  /* Last synced schedule epoch time */
     bool     pumpBySchedule;    /* Flag indicating pump was started by schedule */
     uint16_t normalInterval;    /* Normal deep sleep interval to restore */
-    uint16_t lastWateringDay;   /* Track day of year to ensure only once per day watering */
+    uint16_t lastWateringDay;   /* slotDay value when the schedule last ran
+                                 * (0xFFFF = never) → once per day */
 
     /* Last-sent values for delta-threshold detection */
     int8_t   lastSentTemp;      /* Last temperature × 10 sent (INT8_MIN = never sent) */
@@ -169,9 +238,23 @@ typedef struct __attribute__((packed)) {
     uint8_t  deltaHumidity;     /* % (default HUM_DELTA_THRESHOLD) */
     uint8_t  deltaSoil;         /* % (default SOIL_DELTA_THRESHOLD) */
     uint8_t  deltaBattery;      /* % (default BATTERY_DELTA_THRESHOLD) */
+
+    /* ── Baseline time axis (15-min slots) ── */
+    uint8_t  currentSlot;       /* last known slot 0..95 */
+    bool     slotValid;         /* true once a slot has been synced via downlink */
+    uint16_t slotDay;           /* day counter: +1 at every t=0 wrap. Gives the
+                                 * daily schedule a "once per day" notion without
+                                 * needing an absolute (epoch) clock. */
+    uint32_t slotElapsedUs;     /* µs elapsed inside the current slot, accumulated
+                                 * from the RTC clock (REAL time, not the nominal
+                                 * sleep interval) — see config_advance_slot_us() */
+    int32_t  slotErrorUs;       /* Phase of the local estimate inside the gateway's
+                                 * slot at the last re-sync. Healthy = [0, SLOT_US)
+                                 * (same slot as the gateway). Less than 0 or
+                                 * >= SLOT_US ⇒ local numbering was off by ≥1 slot. */
 } app_config_t;
 
-#define CONFIG_MAGIC 0x49525247  /* "IRRG" */
+#define CONFIG_MAGIC 0x49525233  /* "IRR3" — slot elapsed in µs + slot error field */
 
 /* ──────────── Public API ──────────── */
 
@@ -224,6 +307,37 @@ void config_set_delta_battery(uint8_t val);
 /* ──────────── NVS Threshold Persistence ──────────── */
 void save_threshold_to_nvs(void);
 void load_threshold_from_nvs(void);
+
+/* ──────────── Baseline time axis (15-minute slots) ──────────── */
+/* Set from a downlink carrying the gateway's current slot; marks slot valid.
+ * A re-sync also records how far the local estimate had drifted (slotErrorUs). */
+void config_set_current_slot(uint8_t slot);
+/* Advance the estimated slot by REAL elapsed time, measured on the RTC counter
+ * (`esp_clk_rtc_time()` delta — it keeps running across deep sleep). */
+void config_advance_slot_us(uint64_t elapsed_us);
+/* Legacy helper: advance by whole seconds (wrapper around the µs version). */
+void config_advance_slot(uint32_t elapsed_s);
+uint8_t config_get_slot(void);
+bool config_slot_valid(void);
+/* µs already elapsed inside the current slot, measured on the RTC clock. */
+uint32_t config_slot_elapsed_us(void);
+/* Phase of the local estimate inside the gateway's slot at the last re-sync, in µs.
+ * Healthy = [0, SLOT_US): the node is in the same slot as the gateway.
+ * < 0 or >= SLOT_US ⇒ the node had drifted by at least one whole slot. */
+int32_t config_get_slot_error_us(void);
+
+/* ──────────── Slot-day counter + daily schedule state ────────────
+ * The node has no absolute clock: the schedule runs on the same 15-minute time
+ * axis (t) as the baseline. `slotDay` counts the t=0 (midnight) wraps, which is
+ * all that is needed to run the schedule once per day. */
+uint16_t config_get_slot_day(void);
+/* slotDay value recorded when the schedule last ran (0xFFFF = never). */
+uint16_t config_get_last_watering_day(void);
+/* Marks "schedule already executed on this day" and persists it. */
+void config_set_last_watering_day(uint16_t day);
+/* NVS persistence so a reset / power loss cannot repeat the same day's run. */
+void save_schedule_state_to_nvs(void);
+void load_schedule_state_from_nvs(void);
 
 #ifdef __cplusplus
 }
