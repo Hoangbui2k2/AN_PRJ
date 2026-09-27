@@ -292,32 +292,39 @@ void config_set_last_watering_day(uint16_t day)
     ESP_LOGI(TAG, "Schedule marked as executed on slot-day %u", day);
 }
 
-void config_set_current_slot(uint8_t slot)
+void config_set_current_slot(uint8_t slot, uint32_t phase_ms)
 {
     if (slot > SLOT_MAX) slot = SLOT_MAX;
+    if (phase_ms >= SLOT_MS) phase_ms %= SLOT_MS;
 
     if (!rtc_config.slotValid) {
-        ESP_LOGI(TAG, "Slot synced (first): %u", slot);
+        ESP_LOGI(TAG, "Slot synced (first): %u (phase %lu ms)", slot,
+                 (unsigned long)phase_ms);
         rtc_config.slotErrorUs = 0;
     } else {
         /* Measure the local estimate before overwriting it.
          *   local   = currentSlot * SLOT_US + slotElapsedUs
-         *   gateway = slot * SLOT_US (+ an unknown fraction of the slot)
-         * phase = local − gateway. While both sides are in the SAME slot the
-         * phase is simply slotElapsedUs (0..SLOT_US). A wrapped slot-index
+         *   gateway = slot * SLOT_US + phase_ms
+         * phase  = local − gateway. While both sides are in the SAME slot the
+         * phase is simply slotElapsedUs − phase_ms. A wrapped slot-index
          * difference `d != 0`, or a phase outside [0, SLOT_US), means the local
          * numbering had drifted by at least one whole slot. */
         int32_t d = (int32_t)rtc_config.currentSlot - (int32_t)slot;
         if (d >  SLOTS_PER_DAY / 2) d -= SLOTS_PER_DAY;
         if (d < -(SLOTS_PER_DAY / 2)) d += SLOTS_PER_DAY;
         rtc_config.slotErrorUs = (int32_t)((int64_t)d * (int64_t)SLOT_US +
-                                           (int64_t)rtc_config.slotElapsedUs);
+                                           (int64_t)rtc_config.slotElapsedUs -
+                                           (int64_t)phase_ms);
 
-        ESP_LOGI(TAG, "Slot sync: %u -> %u | local phase %lu ms in slot, "
+        ESP_LOGI(TAG, "Slot sync: %u -> %u | phase %lu ms (local %lu ms), "
                  "slot-index delta %+d (%s)",
                  rtc_config.currentSlot, slot,
+                 (unsigned long)phase_ms,
                  (unsigned long)(rtc_config.slotElapsedUs / 1000UL), (int)d,
-                 (d == 0 && rtc_config.slotElapsedUs < SLOT_US) ? "OK" : "DRIFT >= 1 slot");
+                 (d == 0 &&
+                  (int64_t)rtc_config.slotElapsedUs - (int64_t)phase_ms >= 0 &&
+                  (int64_t)rtc_config.slotElapsedUs - (int64_t)phase_ms < (int64_t)SLOT_US)
+                    ? "OK" : "DRIFT >= 1 slot");
     }
 
     /* Day counter: only a LARGE backward jump (typically 95 -> 0 at midnight) is
@@ -330,7 +337,7 @@ void config_set_current_slot(uint8_t slot)
 
     rtc_config.currentSlot = slot;
     rtc_config.slotValid = true;
-    rtc_config.slotElapsedUs = 0;
+    rtc_config.slotElapsedUs = phase_ms;
 }
 
 void config_advance_slot_us(uint64_t elapsed_us)

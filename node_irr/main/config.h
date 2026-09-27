@@ -33,7 +33,7 @@ typedef enum {
 #define PKT_TYPE_HEARTBEAT   0x02  /* Node -> Gateway: heartbeat (8-byte fixed, legacy) */
 #define PKT_TYPE_ACK         0x03  /* Gateway -> Node / Node -> Gateway: ACK (8-byte fixed) */
 #define PKT_TYPE_ALARM       0x04  /* Node -> Gateway: alarm (8-byte fixed) */
-#define PKT_TYPE_CMD         0x05  /* Gateway -> Node: command (7-byte fixed incl. slot) */
+#define PKT_TYPE_CMD         0x05  /* Gateway -> Node: command (10-byte fixed incl. slot+phase) */
 #define PKT_TYPE_DATA_COMPACT 0x06 /* Node -> Gateway: compact sensor data (variable-length) */
 #define PKT_TYPE_BASELINE    0x07  /* Gateway -> Node: baseline chunk (variable-length) */
 #define PKT_TYPE_BASELINE_DONE 0x08 /* Node -> Gateway: one baseline series stored */
@@ -152,11 +152,13 @@ typedef enum {
 #define DELTA_TYPE_SOIL          2    /* param2 = % (default 10) */
 #define DELTA_TYPE_BATTERY       3    /* param2 = % (default 10) */
 
-/* ──────────── LoRa 7-byte Command Packet (v2: +slot) ────────────
+/* ──────────── LoRa 10-byte Command Packet (v3: +slot +phase) ────────────
  * Downlink frame layout:
- *   0 dest | 1 type(0x05) | 2 cmd | 3 param1 | 4 param2 | 5 slot | 6 crc
- * `slot` is the gateway's current 15-minute slot (0..95) and is present in
- * EVERY downlink, so the node is time-synced on any exchange.
+ *   0 dest | 1 type(0x05) | 2 cmd | 3 param1 | 4 param2 | 5 slot
+ *   6 phase_lo | 7 phase_mid | 8 phase_hi | 9 crc
+ * `slot` is the gateway's current 15-minute slot (0..95) and `phase` (24-bit
+ * little-endian) is the ms already elapsed inside that slot. Both are present
+ * in EVERY downlink so the node is time-synced (slot + exact in-slot phase).
  */
 typedef struct __attribute__((packed)) {
     uint8_t dest;       /* 0xFF=broadcast or node ID */
@@ -165,7 +167,10 @@ typedef struct __attribute__((packed)) {
     uint8_t param1;     /* Parameter 1 */
     uint8_t param2;     /* Parameter 2 */
     uint8_t slot;       /* Current slot 0..95 (SLOT_MAX) */
-    uint8_t crc;        /* CRC8 of bytes 0-5 */
+    uint8_t phase_lo;   /* Phase ms (bits 0-7) */
+    uint8_t phase_mid;  /* Phase ms (bits 8-15) */
+    uint8_t phase_hi;   /* Phase ms (bits 16-23) */
+    uint8_t crc;        /* CRC8 of bytes 0-8 */
 } lora_cmd_packet_t;
 
 /* ──────────── LoRa baseline chunk frame (GW -> Node, type 0x07) ────────────
@@ -309,9 +314,11 @@ void save_threshold_to_nvs(void);
 void load_threshold_from_nvs(void);
 
 /* ──────────── Baseline time axis (15-minute slots) ──────────── */
-/* Set from a downlink carrying the gateway's current slot; marks slot valid.
- * A re-sync also records how far the local estimate had drifted (slotErrorUs). */
-void config_set_current_slot(uint8_t slot);
+/* Set from a downlink carrying the gateway's current slot + in-slot phase (ms);
+ * marks slot valid. A re-sync also records how far the local estimate had
+ * drifted (slotErrorUs). slotElapsedUs is set to phase_ms (not 0) so the node's
+ * time axis matches the gateway to the millisecond. */
+void config_set_current_slot(uint8_t slot, uint32_t phase_ms);
 /* Advance the estimated slot by REAL elapsed time, measured on the RTC counter
  * (`esp_clk_rtc_time()` delta — it keeps running across deep sleep). */
 void config_advance_slot_us(uint64_t elapsed_us);

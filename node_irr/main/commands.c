@@ -114,7 +114,7 @@ static void cmd_dedup_store(uint8_t cmd, uint8_t p1, uint8_t p2)
  *        more header bytes are still needed.
  *
  * Supported downlink frames:
- *   - 0x05 command : fixed 7 bytes (dest|type|cmd|p1|p2|slot|crc)
+ *   - 0x05 command : fixed 10 bytes (dest|type|cmd|p1|p2|slot|phase_lo|phase_mid|phase_hi|crc)
  *   - 0x07 baseline: 7 + 2*n_points + 1 (variable)
  *   - anything else: legacy 8-byte frame (ACK etc.)
  */
@@ -124,7 +124,7 @@ static int lora_frame_need(const uint8_t *buf, int acc_len)
 
     uint8_t type = buf[1];
     if (type == PKT_TYPE_CMD) {
-        return (int)sizeof(lora_cmd_packet_t);      /* 7 */
+        return (int)sizeof(lora_cmd_packet_t);      /* 10 */
     }
     if (type == PKT_TYPE_BASELINE) {
         if (acc_len < 7) return 0;                  /* need n_points first */
@@ -133,6 +133,14 @@ static int lora_frame_need(const uint8_t *buf, int acc_len)
         return 7 + 2 * n + 1;
     }
     return 8;                                       /* legacy / ACK */
+}
+
+/* Giải mã phase (ms trong slot, 24-bit little-endian) từ frame downlink v3. */
+static uint32_t lora_cmd_phase(const lora_cmd_packet_t *cmd)
+{
+    return (uint32_t)cmd->phase_lo |
+           ((uint32_t)cmd->phase_mid << 8) |
+           ((uint32_t)cmd->phase_hi << 16);
 }
 
 /**
@@ -267,8 +275,9 @@ static int process_downlink_frame(const uint8_t *buf, int len,
         lora_cmd_packet_t cmd;
         memcpy(&cmd, buf, sizeof(cmd));
         uint8_t calc = crc8_xor((uint8_t *)&cmd, sizeof(cmd) - 1);
-        ESP_LOGI(TAG, "Downlink cmd: dest=0x%02X type=0x%02X cmd=0x%02X p1=0x%02X p2=0x%02X slot=%u crc=0x%02X (calc=0x%02X)",
-                 cmd.dest, cmd.type, cmd.cmd, cmd.param1, cmd.param2, cmd.slot, cmd.crc, calc);
+        ESP_LOGI(TAG, "Downlink cmd: dest=0x%02X type=0x%02X cmd=0x%02X p1=0x%02X p2=0x%02X slot=%u phase=%lu crc=0x%02X (calc=0x%02X)",
+                 cmd.dest, cmd.type, cmd.cmd, cmd.param1, cmd.param2, cmd.slot,
+                 (unsigned long)lora_cmd_phase(&cmd), cmd.crc, calc);
 
         if (cmd.crc != calc) {
             ESP_LOGW(TAG, "Downlink CRC mismatch - NOT acknowledging (spec A)");
@@ -280,8 +289,8 @@ static int process_downlink_frame(const uint8_t *buf, int len,
             lora_flush();
             return -1;
         }
-        /* Every valid downlink carries the gateway's current slot → time sync. */
-        config_set_current_slot(cmd.slot);
+        /* Every valid downlink carries the gateway's current slot + phase → time sync. */
+        config_set_current_slot(cmd.slot, lora_cmd_phase(&cmd));
 
         ESP_LOGI(TAG, "Valid downlink command 0x%02X - processing", cmd.cmd);
         commands_process(&cmd, data);
@@ -1098,7 +1107,7 @@ void commands_wait_baseline(uint32_t timeout_ms)
                          cmd.dest);
                 continue;
             }
-            config_set_current_slot(cmd.slot);
+            config_set_current_slot(cmd.slot, lora_cmd_phase(&cmd));
             commands_process(&cmd, NULL);
             config_reset_gw_lost();
             continue;

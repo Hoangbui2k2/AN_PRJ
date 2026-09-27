@@ -83,7 +83,7 @@ static int rx_frame_len(const uint8_t *buf, int avail)
         return -1;
     }
     if (type == PKT_TYPE_CMD) {
-        return LORA_DOWNLINK_SIZE;   /* 7-byte downlink command (own echo) */
+        return LORA_DOWNLINK_SIZE;   /* 10-byte downlink command (own echo) */
     }
     if (type == PKT_TYPE_BASELINE) {
         /* Own baseline-chunk echo: need 7 header bytes to read n_points. */
@@ -491,10 +491,10 @@ static bool lora_transmit_packet(const uint8_t *buf, size_t len)
 }
 
 bool lora_send_command(uint8_t node_id, uint8_t command, uint8_t param1,
-                       uint8_t param2, uint8_t slot)
+                       uint8_t param2, uint8_t slot, uint32_t phase_ms)
 {
-    /* Build the 7-byte downlink packet:
-     *   dest | 0x05 | cmd | p1 | p2 | slot | crc */
+    /* Build the 10-byte downlink packet:
+     *   dest | 0x05 | cmd | p1 | p2 | slot | phase_lo | phase_mid | phase_hi | crc */
     uint8_t buf[LORA_DOWNLINK_SIZE];
     buf[0] = node_id;
     buf[1] = LORA_CMD_HEADER;      /* 0x05 */
@@ -502,8 +502,11 @@ bool lora_send_command(uint8_t node_id, uint8_t command, uint8_t param1,
     buf[3] = param1;
     buf[4] = param2;
     buf[5] = (uint8_t)(slot & 0x7F);
-    /* CRC is XOR of bytes 0-5, placed in byte 6 */
-    buf[6] = crc8_calculate(buf, 6);
+    buf[6] = (uint8_t)(phase_ms & 0xFFu);
+    buf[7] = (uint8_t)((phase_ms >> 8) & 0xFFu);
+    buf[8] = (uint8_t)((phase_ms >> 16) & 0xFFu);
+    /* CRC is XOR of bytes 0-8, placed in byte 9 */
+    buf[9] = crc8_calculate(buf, LORA_DOWNLINK_SIZE - 1);
 
     /* Serialise TX against other tasks sending downlinks */
     if (s_tx_mutex != NULL &&
@@ -520,8 +523,8 @@ bool lora_send_command(uint8_t node_id, uint8_t command, uint8_t param1,
     }
 
     if (ok) {
-        ESP_LOGD(TAG, "LoRa TX: Node=0x%02X Cmd=0x%02X P1=%d P2=%d Slot=%u CRC=0x%02X",
-                 node_id, command, param1, param2, buf[5], buf[6]);
+        ESP_LOGD(TAG, "LoRa TX: Node=0x%02X Cmd=0x%02X P1=%d P2=%d Slot=%u Phase=%lu CRC=0x%02X",
+                 node_id, command, param1, param2, buf[5], (unsigned long)phase_ms, buf[9]);
     }
 
     return ok;
@@ -570,10 +573,10 @@ bool lora_send_baseline_chunk(uint8_t node_id, uint8_t series, uint8_t version,
     return ok;
 }
 
-bool lora_send_ack(uint8_t node_id, uint8_t slot)
+bool lora_send_ack(uint8_t node_id, uint8_t slot, uint32_t phase_ms)
 {
-    /* Build the 7-byte downlink ACK packet:
-     *   dest | 0x05 | 0x09 | 0 | 0 | slot | crc */
+    /* Build the 10-byte downlink ACK packet:
+     *   dest | 0x05 | 0x09 | 0 | 0 | slot | phase_lo | phase_mid | phase_hi | crc */
     uint8_t buf[LORA_DOWNLINK_SIZE];
     buf[0] = node_id;
     buf[1] = LORA_CMD_HEADER;      /* 0x05 */
@@ -581,7 +584,10 @@ bool lora_send_ack(uint8_t node_id, uint8_t slot)
     buf[3] = 0;
     buf[4] = 0;
     buf[5] = (uint8_t)(slot & 0x7F);
-    buf[6] = crc8_calculate(buf, 6);
+    buf[6] = (uint8_t)(phase_ms & 0xFFu);
+    buf[7] = (uint8_t)((phase_ms >> 8) & 0xFFu);
+    buf[8] = (uint8_t)((phase_ms >> 16) & 0xFFu);
+    buf[9] = crc8_calculate(buf, LORA_DOWNLINK_SIZE - 1);
 
     /* Serialise against other downlink transmitters */
     if (s_tx_mutex != NULL &&
@@ -597,8 +603,8 @@ bool lora_send_ack(uint8_t node_id, uint8_t slot)
     }
 
     if (ok) {
-        ESP_LOGD(TAG, "LoRa TX ACK: Node=0x%02X slot=%u (no command) CRC=0x%02X",
-                 node_id, buf[5], buf[6]);
+        ESP_LOGD(TAG, "LoRa TX ACK: Node=0x%02X slot=%u phase=%lu (no command) CRC=0x%02X",
+                 node_id, buf[5], (unsigned long)phase_ms, buf[9]);
     }
 
     return ok;

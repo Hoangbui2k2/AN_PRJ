@@ -382,8 +382,11 @@ static void send_cached_commands_for_node(uint8_t node_id)
         ESP_LOGI(TAG, "Sending cached command to node 0x%02X (retry %d/%d)",
                  node_id, cached->retry_count, MAX_RETRY);
 
+        uint8_t  slot  = 0;
+        uint32_t phase = 0;
+        slot_snapshot(&slot, &phase);
         if (lora_send_command(cached->cmd[0], cached->cmd[2],
-                              cached->cmd[3], cached->cmd[4], slot_current())) {
+                              cached->cmd[3], cached->cmd[4], slot, phase)) {
             command_cache_mark_sent(cached);
         } else {
             ESP_LOGW(TAG, "Failed to send cached command to node 0x%02X", node_id);
@@ -443,7 +446,10 @@ static void ack_or_flush_node(uint8_t node_id)
     if (command_cache_count_for_node(node_id) > 0) {
         send_cached_commands_for_node(node_id);
     } else {
-        if (lora_send_ack(node_id, slot_current())) {
+        uint8_t  slot  = 0;
+        uint32_t phase = 0;
+        slot_snapshot(&slot, &phase);
+        if (lora_send_ack(node_id, slot, phase)) {
             ESP_LOGI(TAG, "Sent empty ACK to node 0x%02X (no command queued)", node_id);
         }
     }
@@ -1234,8 +1240,11 @@ static void slot_boundary_check(void)
     }
     if (now_ms < next_ms) return;
 
-    /* dest=0xFF (broadcast), cmd=0x09 keep-alive, slot=0 */
-    lora_send_command(0xFF, LORA_CMD_ACK, 0, 0, 0);
+    /* dest=0xFF (broadcast), cmd=0x09 keep-alive, slot=0 (+ phase thực tại mốc 00:00) */
+    uint8_t  slot  = 0;
+    uint32_t phase = 0;
+    slot_snapshot(&slot, &phase);
+    lora_send_command(0xFF, LORA_CMD_ACK, 0, 0, slot, phase);
     next_ms = now_ms + BROADCAST_GAP_MS;
 }
 
@@ -1260,8 +1269,9 @@ static void cmd_retry_task(void *pvParameters)
          * burn LoRa airtime and risk colliding with the node's listen window. */
         command_cache_process_timeouts();
 
-        /* Keep the slot estimate fresh (drives wrap detection) and broadcast
-         * the t=0 sync around the day boundary. */
+        /* Thăm dò SNTP đúng một chỗ (để chốt s_have_real_time); giữ slot estimate
+         * tươi (drives wrap detection) và broadcast t=0 quanh mốc đầu ngày. */
+        slot_sntp_poll();
         (void)slot_current();
         slot_boundary_check();
 

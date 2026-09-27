@@ -30,10 +30,10 @@ extern "C" {
 
 /* Packet Definitions */
 #define LORA_UPLINK_SIZE   8   /* Uplink packet size (Node -> Gateway, legacy/ACK) */
-#define LORA_DOWNLINK_SIZE 7   /* Downlink command size (v2: +slot byte) */
+#define LORA_DOWNLINK_SIZE 10  /* Downlink command size (v3: +slot byte + 3 phase bytes) */
 #define LORA_CMD_HEADER    0x05 /* Command header byte for downlink */
 
-/* ── v2 packet types (slot + baseline) ── */
+/* ── v3 packet types (slot+phase + baseline) ── */
 #define PKT_TYPE_BASELINE      0x07  /* GW -> Node: baseline chunk (variable) */
 #define PKT_TYPE_BASELINE_DONE 0x08  /* Node -> GW: one baseline series stored */
 #define PKT_TYPE_REQ           0x09  /* Node -> GW: request (time and/or baseline) */
@@ -123,10 +123,14 @@ typedef struct __attribute__((packed)) {
 #define DELTA_TYPE_SOIL          2  /* param2 = % (e.g. 10) */
 #define DELTA_TYPE_BATTERY       3  /* param2 = % (e.g. 10) */
 
-/* Downlink Packet Structure (7 bytes, v2)
- *   0 node_id | 1 header(0x05) | 2 command | 3 param1 | 4 param2 | 5 slot | 6 crc
+/* Downlink Packet Structure (10 bytes, v3)
+ *   0 node_id | 1 header(0x05) | 2 command | 3 param1 | 4 param2 | 5 slot
+ *   6 phase_lo | 7 phase_mid | 8 phase_hi | 9 crc
  * `slot` carries the gateway's current 15-minute slot (0..95) in EVERY
  * downlink so the node is time-synced on any exchange.
+ * `phase` (bytes 6-8, 24-bit little-endian) is the number of ms already elapsed
+ * INSIDE that slot (0..SLOT_MS-1), so the node can set its in-slot phase
+ * accurately instead of resetting it to 0 on every sync.
  */
 typedef struct __attribute__((packed)) {
     uint8_t node_id;     /* Byte 0: Node ID (0xFF = broadcast) */
@@ -135,7 +139,10 @@ typedef struct __attribute__((packed)) {
     uint8_t param1;      /* Byte 3: Parameter 1 */
     uint8_t param2;      /* Byte 4: Parameter 2 */
     uint8_t slot;        /* Byte 5: current slot 0..95 */
-    uint8_t crc;         /* Byte 6: CRC8 checksum of bytes 0-5 */
+    uint8_t phase_lo;    /* Byte 6: phase ms (bits 0-7) */
+    uint8_t phase_mid;   /* Byte 7: phase ms (bits 8-15) */
+    uint8_t phase_hi;    /* Byte 8: phase ms (bits 16-23) */
+    uint8_t crc;         /* Byte 9: CRC8 checksum of bytes 0-8 */
 } lora_downlink_packet_t;
 
 /**
@@ -171,33 +178,35 @@ bool lora_read_packet(lora_uplink_packet_t *packet);
 /**
  * @brief Send a downlink command to a node
  *
- * Constructs a 7-byte packet (v2, includes the current slot) with CRC and
- * transmits via UART. Waits for AUX to indicate module is ready before sending.
+ * Constructs a 10-byte packet (v3, includes the current slot + in-slot phase ms)
+ * with CRC and transmits via UART. Waits for AUX to indicate module is ready.
  *
  * @param node_id Target node ID (0xFF = broadcast)
  * @param command Command byte
  * @param param1 First parameter
  * @param param2 Second parameter
  * @param slot   Current 15-minute slot (0..SLOT_MAX)
+ * @param phase_ms Ms elapsed inside the slot (0..SLOT_MS-1)
  * @return true if packet was sent successfully
  */
 bool lora_send_command(uint8_t node_id, uint8_t command, uint8_t param1,
-                       uint8_t param2, uint8_t slot);
+                       uint8_t param2, uint8_t slot, uint32_t phase_ms);
 
 /**
  * @brief Send an empty ACK (no command) to a node
  *
- * Builds a 7-byte downlink packet with command LORA_CMD_ACK (0x09) and no
- * parameters, carrying the current slot. Used when the gateway receives an
- * uplink but has no queued command for the node, so the node does not sit
+ * Builds a 10-byte downlink packet with command LORA_CMD_ACK (0x09) and no
+ * parameters, carrying the current slot + phase. Used when the gateway receives
+ * an uplink but has no queued command for the node, so the node does not sit
  * waiting for an ACK (which would otherwise inflate its gatewayLostCount and
  * eventually trigger a "gateway lost" alarm).
  *
  * @param node_id Target node ID
  * @param slot    Current slot 0..SLOT_MAX
+ * @param phase_ms Ms elapsed inside the slot (0..SLOT_MS-1)
  * @return true if packet was sent successfully
  */
-bool lora_send_ack(uint8_t node_id, uint8_t slot);
+bool lora_send_ack(uint8_t node_id, uint8_t slot, uint32_t phase_ms);
 
 /**
  * @brief Send one baseline chunk (type 0x07) to a node

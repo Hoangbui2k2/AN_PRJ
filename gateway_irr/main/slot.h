@@ -15,6 +15,10 @@ extern "C" {
 
 #define SLOT_MAX      95
 
+/* Múi giờ địa phương cho slot_from_wall_clock(). POSIX TZ: "std offset" với
+ * offset DƯƠNG = phía TÂY của UTC, nên Việt Nam (UTC+7, không DST) viết là -7. */
+#define SLOT_TIMEZONE  "ICT-7"
+
 /**
  * @brief Initialise the slot manager. The slot base starts at "now"; call
  *        slot_sync_reset() when the server issues a sync.
@@ -32,6 +36,15 @@ void slot_time_sync_start(void);
 
 /** @return true khi đã có giờ thực (SNTP) */
 bool slot_time_synced(void);
+
+/**
+ * @brief Thăm dò SNTP đúng một chỗ (gọi định kỳ từ watchdog gateway).
+ *
+ * esp_sntp_get_sync_status() là lệnh CONSUMING: trả COMPLETED đúng một lần rồi
+ * reset cờ. Vì vậy chỉ hàm này được gọi nó; khi thấy COMPLETED sẽ chốt
+ * s_have_real_time và slot_current()/slot_time_synced() chuyển sang giờ thực.
+ */
+void slot_sntp_poll(void);
 
 /**
  * @brief Server báo "hiện tại là slot N trong ngày" (sync_slot kèm "slot":N).
@@ -59,6 +72,15 @@ void slot_clear_wrap(void);
 
 /** @return configured slot width in ms */
 uint32_t slot_width_ms(void);
+
+/**
+ * @brief Đọc slot + phase từ CÙNG một mẫu thời gian (nhất quán với nhau).
+ *
+ * Dùng khi gửi downlink: slot và phase phải khớp cùng một thời điểm, nếu không
+ * ngay tại biên 15 phút có thể gửi slot=N nhưng phase đã gần 900000 ms.
+ * Khi đã có giờ thực thì tính từ đồng hồ (giây+phần giây); chưa thì từ uptime.
+ */
+void slot_snapshot(uint8_t *slot_out, uint32_t *phase_out);
 
 #ifdef __cplusplus
 }
